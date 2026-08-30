@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>iPhone Scroll Control</string>
+    <key>CFBundleExecutable</key>
+    <string>iphone-scroll-control</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.hongxin.iPhoneScrollControl</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>iPhone Scroll Control</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.1.1</string>
+    <key>CFBundleVersion</key>
+    <string>3</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>15.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>监听 Logitech 鼠标侧键，以便在 iPhone 镜像前台时切换视频。</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>创建 iPhone 镜像窗口的实时浮动预览，使画面保持在普通窗口上方。</string>
+</dict>
+</plist>

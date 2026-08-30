@@ -1,0 +1,9 @@
+.DS_Store
+build/
+dist/
+*.log
+*.error.log
+*.dSYM/
+DerivedData/
+xcuserdata/
+*.previous-*.app/
