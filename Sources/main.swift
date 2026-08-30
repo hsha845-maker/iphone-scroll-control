@@ -126,6 +126,12 @@ private func frameDescription(_ frame: CGRect) -> String {
 // them a second time.
 private let syntheticReplayMarker: Int64 = 0x4950_5343
 
+private extension Notification.Name {
+    static let iPhoneScrollControlWillSuspendTarget = Notification.Name(
+        "iPhoneScrollControlWillSuspendTarget"
+    )
+}
+
 // MARK: - iPhone Mirroring window lookup
 
 final class IPhoneMirroringController {
@@ -168,6 +174,63 @@ final class IPhoneMirroringController {
 
         return NSWorkspace.shared.runningApplications.first { app in
             app.localizedName.map { config.allowedApplicationNames.contains($0) } ?? false
+        }
+    }
+
+    // AX can keep returning the last window frame after the application has
+    // been hidden or its window has been minimized. Require both application
+    // state and a real, currently on-screen WindowServer entry before treating
+    // that old frame as interactive.
+    func isTargetWindowInteractive(_ app: NSRunningApplication? = nil) -> Bool {
+        guard let app = app ?? runningTargetApplication(), !app.isHidden else {
+            return false
+        }
+
+        let applicationElement = AXUIElementCreateApplication(app.processIdentifier)
+        var windowValue: CFTypeRef?
+        var result = AXUIElementCopyAttributeValue(
+            applicationElement,
+            kAXFocusedWindowAttribute as CFString,
+            &windowValue
+        )
+        if result != .success || windowValue == nil {
+            result = AXUIElementCopyAttributeValue(
+                applicationElement,
+                kAXMainWindowAttribute as CFString,
+                &windowValue
+            )
+        }
+
+        if result == .success, let windowValue {
+            let window = unsafeBitCast(windowValue, to: AXUIElement.self)
+            var minimizedValue: CFTypeRef?
+            if AXUIElementCopyAttributeValue(
+                window,
+                kAXMinimizedAttribute as CFString,
+                &minimizedValue
+            ) == .success,
+            let minimized = minimizedValue as? Bool,
+            minimized {
+                return false
+            }
+        }
+
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return false
+        }
+
+        return windows.contains { info in
+            let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+            guard ownerPID == app.processIdentifier, alpha > 0,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else {
+                return false
+            }
+            return frame.width * frame.height > 10_000
         }
     }
 
@@ -672,6 +735,8 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
     private var displayLayer: AVSampleBufferDisplayLayer?
     private var sourceWindowID: CGWindowID?
     private var frameTimer: Timer?
+    private var suspendObserver: NSObjectProtocol?
+    private var hideObserver: NSObjectProtocol?
 
     init(
         config: Config,
@@ -686,6 +751,27 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
 
     func start() {
         guard config.enableFloatingLivePreview else { return }
+
+        suspendObserver = NotificationCenter.default.addObserver(
+            forName: .iPhoneScrollControlWillSuspendTarget,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.hidePanelImmediately(reason: "window action")
+        }
+        hideObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didHideApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                    as? NSRunningApplication,
+                  self.config.allowedBundleIdentifiers.contains(app.bundleIdentifier ?? "")
+                    || self.config.allowedApplicationNames.contains(app.localizedName ?? "")
+            else { return }
+            self.hidePanelImmediately(reason: "application hidden")
+        }
 
         guard CGPreflightScreenCaptureAccess() else {
             print("Screen Recording permission required for the floating live preview.")
@@ -725,6 +811,21 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
             Task { try? await stream.stopCapture() }
         }
         stream = nil
+        if let suspendObserver {
+            NotificationCenter.default.removeObserver(suspendObserver)
+            self.suspendObserver = nil
+        }
+        if let hideObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(hideObserver)
+            self.hideObserver = nil
+        }
+    }
+
+    @MainActor
+    private func hidePanelImmediately(reason: String) {
+        panel?.ignoresMouseEvents = true
+        panel?.orderOut(nil)
+        print("Floating preview suspended immediately: \(reason).")
     }
 
     private func configureCapture(for target: SCWindow) async throws {
@@ -812,7 +913,7 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
     @MainActor
     private func startFrameSyncTimer() {
         frameTimer?.invalidate()
-        frameTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) {
+        frameTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) {
             [weak self] _ in
             guard let self, let sourceWindowID else { return }
 
@@ -821,7 +922,7 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
             // Do not let our floating preview make that window appear impossible
             // to hide: mirror the real window's on-screen state.
             guard isSourceWindowOnScreen(sourceWindowID) else {
-                panel?.orderOut(nil)
+                hidePanelImmediately(reason: "source window is not on screen")
                 return
             }
 
@@ -865,6 +966,11 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
 
     @MainActor
     private func activateIPhoneMirroring() {
+        guard let sourceWindowID, isSourceWindowOnScreen(sourceWindowID),
+              mirroringController.isTargetWindowInteractive() else {
+            hidePanelImmediately(reason: "ignored click on suspended source")
+            return
+        }
         let activated = mirroringController.activateTargetApplication()
         panel?.ignoresMouseEvents = true
         print("Floating preview click: activated iPhone Mirroring = \(activated).")
@@ -1332,6 +1438,10 @@ final class MouseEventMonitor {
            pageContextDetector.currentPageKind() == .video,
            let minimizeFrame = mirroringController.minimizeButtonFrame(of: targetApp),
            minimizeFrame.insetBy(dx: -5, dy: -5).contains(event.location) {
+            NotificationCenter.default.post(
+                name: .iPhoneScrollControlWillSuspendTarget,
+                object: nil
+            )
             consumeNextLeftMouseUp = true
             swipeController.pauseThenPerformWindowButtonClick(
                 at: event.location,
@@ -1342,6 +1452,7 @@ final class MouseEventMonitor {
 
         if type == .leftMouseDown,
            let targetApp = mirroringController.runningTargetApplication(),
+           mirroringController.isTargetWindowInteractive(targetApp),
            NSWorkspace.shared.frontmostApplication?.processIdentifier
                 != targetApp.processIdentifier,
            let frame = mirroringController.focusedWindowFrame(of: targetApp),
@@ -1371,6 +1482,10 @@ final class MouseEventMonitor {
                 }
                 if let targetApp = mirroringController.frontmostTargetApplication(),
                    pageContextDetector.currentPageKind() == .video {
+                    NotificationCenter.default.post(
+                        name: .iPhoneScrollControlWillSuspendTarget,
+                        object: nil
+                    )
                     consumedKeyboardKeyUps.insert(keyCode)
                     swipeController.pauseThenPerformSystemShortcut(
                         keyCode: keyCode,
