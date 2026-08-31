@@ -2,7 +2,7 @@
 
 一个轻量级原生 macOS 工具，用 Logitech 鼠标侧键和键盘快捷键控制「iPhone Mirroring / iPhone 镜像」中的抖音视频。
 
-当前版本：**1.1.2**
+当前版本：**1.1.3**
 系统要求：macOS 15 或更高版本
 架构：Apple Silicon（arm64）与 Intel（x86_64）
 
@@ -27,6 +27,7 @@
 - 点击悬浮画面可激活真实的 iPhone Mirroring。
 - 真实窗口最小化、隐藏或离开当前桌面时，预览同步消失。
 - 隐藏或最小化后，工具立即暂停全部镜像交互；点击原窗口区域不会重新唤出镜像。
+- 隐藏、最小化或离开当前桌面后会停止 ScreenCaptureKit 采集，菜单栏 sharing 状态随之结束；恢复窗口后自动重新采集。
 - 上下独立圆角遮罩用于清除镜像画面四角黑边。
 
 ## 安全与输入保护
@@ -39,7 +40,7 @@
 
 ## 安装发布版
 
-从 GitHub Releases 下载 `iPhone-Scroll-Control-1.1.2-macOS.dmg`：
+从 GitHub Releases 下载 `iPhone-Scroll-Control-1.1.3-macOS.dmg`：
 
 1. 打开 DMG。
 2. 按住 Control 点击“安装.command”，选择“打开”。
@@ -78,7 +79,7 @@ build/iPhone Scroll Control.app
 输出位置：
 
 ```text
-dist/iPhone-Scroll-Control-1.1.2-macOS.dmg
+dist/iPhone-Scroll-Control-1.1.3-macOS.dmg
 ```
 
 运行静态检查：

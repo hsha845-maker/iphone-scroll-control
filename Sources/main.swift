@@ -730,7 +730,10 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
     private let mirroringController: IPhoneMirroringController
     private let pageContextDetector: PageContextDetector
     private let captureQueue = DispatchQueue(label: "iphone-scroll-control.capture")
+    private let captureStateLock = NSLock()
     private var stream: SCStream?
+    private var captureDesired = false
+    private var captureStartInProgress = false
     private var panel: NSPanel?
     private var displayLayer: AVSampleBufferDisplayLayer?
     private var sourceWindowID: CGWindowID?
@@ -757,7 +760,7 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.hidePanelImmediately(reason: "window action")
+            self?.suspendPreviewAndCapture(reason: "window action")
         }
         hideObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didHideApplicationNotification,
@@ -770,7 +773,7 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
                   self.config.allowedBundleIdentifiers.contains(app.bundleIdentifier ?? "")
                     || self.config.allowedApplicationNames.contains(app.localizedName ?? "")
             else { return }
-            self.hidePanelImmediately(reason: "application hidden")
+            self.suspendPreviewAndCapture(reason: "application hidden")
         }
 
         guard CGPreflightScreenCaptureAccess() else {
@@ -779,26 +782,10 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
             return
         }
 
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(
-                    false,
-                    onScreenWindowsOnly: true
-                )
-                guard let target = content.windows.first(where: {
-                    $0.owningApplication?.bundleIdentifier == "com.apple.ScreenContinuity"
-                        && $0.frame.width > 200
-                        && $0.frame.height > 300
-                }) else {
-                    print("Floating preview: iPhone Mirroring window was not found.")
-                    return
-                }
-                try await configureCapture(for: target)
-            } catch {
-                print("Floating preview failed: \(error.localizedDescription)")
-            }
+        Task { @MainActor [weak self] in
+            self?.startFrameSyncTimer()
         }
+        requestCaptureStart()
     }
 
     func stop() {
@@ -807,10 +794,10 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
         panel?.orderOut(nil)
         panel = nil
         displayLayer = nil
-        if let stream {
-            Task { try? await stream.stopCapture() }
+        let activeStream = updateCaptureState(desired: false, takeActiveStream: true)
+        if let activeStream {
+            Task { try? await activeStream.stopCapture() }
         }
-        stream = nil
         if let suspendObserver {
             NotificationCenter.default.removeObserver(suspendObserver)
             self.suspendObserver = nil
@@ -822,10 +809,91 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
     }
 
     @MainActor
-    private func hidePanelImmediately(reason: String) {
+    private func suspendPreviewAndCapture(reason: String) {
+        let wasVisible = panel?.isVisible == true
         panel?.ignoresMouseEvents = true
         panel?.orderOut(nil)
-        print("Floating preview suspended immediately: \(reason).")
+        let activeStream = updateCaptureState(desired: false, takeActiveStream: true)
+        guard wasVisible || activeStream != nil else { return }
+
+        print("Floating preview and screen sharing suspended: \(reason).")
+        if let activeStream {
+            Task {
+                do {
+                    try await activeStream.stopCapture()
+                    print("Screen capture stopped; sharing indicator can close.")
+                } catch {
+                    print("Failed to stop screen capture: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func requestCaptureStart() {
+        captureStateLock.lock()
+        captureDesired = true
+        guard stream == nil, !captureStartInProgress else {
+            captureStateLock.unlock()
+            return
+        }
+        captureStartInProgress = true
+        captureStateLock.unlock()
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer { finishCaptureStart() }
+
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(
+                    false,
+                    onScreenWindowsOnly: true
+                )
+                guard let target = content.windows.first(where: {
+                    $0.owningApplication?.bundleIdentifier == "com.apple.ScreenContinuity"
+                        && $0.frame.width > 200
+                        && $0.frame.height > 300
+                }) else {
+                    print("Floating preview: visible iPhone Mirroring window was not found.")
+                    return
+                }
+                try await configureCapture(for: target)
+            } catch {
+                print("Floating preview failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func finishCaptureStart() {
+        captureStateLock.lock()
+        captureStartInProgress = false
+        captureStateLock.unlock()
+    }
+
+    private func updateCaptureState(
+        desired: Bool,
+        takeActiveStream: Bool = false
+    ) -> SCStream? {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        captureDesired = desired
+        guard takeActiveStream else { return stream }
+        let activeStream = stream
+        stream = nil
+        return activeStream
+    }
+
+    private func captureShouldRun() -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return captureDesired
+    }
+
+    private func installStartedStream(_ newStream: SCStream) -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        guard captureDesired else { return false }
+        stream = newStream
+        return true
     }
 
     private func configureCapture(for target: SCWindow) async throws {
@@ -854,14 +922,29 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
             sampleHandlerQueue: captureQueue
         )
 
-        await MainActor.run {
-            self.sourceWindowID = target.windowID
-            self.createPanel(frame: target.frame)
-            self.startFrameSyncTimer()
+        guard captureShouldRun() else { return }
+        try await newStream.startCapture()
+
+        guard installStartedStream(newStream) else {
+            try? await newStream.stopCapture()
+            return
         }
 
-        stream = newStream
-        try await newStream.startCapture()
+        await MainActor.run {
+            self.sourceWindowID = target.windowID
+            if self.panel == nil {
+                self.createPanel(frame: target.frame)
+            } else {
+                self.panel?.setFrame(
+                    self.convertQuartzFrameToAppKit(target.frame),
+                    display: true
+                )
+                self.panel?.orderFrontRegardless()
+            }
+            if self.frameTimer == nil {
+                self.startFrameSyncTimer()
+            }
+        }
         print("Floating live preview started for iPhone Mirroring window \(target.windowID).")
     }
 
@@ -915,16 +998,29 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
         frameTimer?.invalidate()
         frameTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) {
             [weak self] _ in
-            guard let self, let sourceWindowID else { return }
+            guard let self else { return }
+            guard let sourceWindowID else {
+                if mirroringController.isTargetWindowInteractive() {
+                    requestCaptureStart()
+                }
+                return
+            }
 
             // A desktop-independent ScreenCaptureKit stream can keep producing
             // the last frame after its source window is hidden or minimized.
             // Do not let our floating preview make that window appear impossible
             // to hide: mirror the real window's on-screen state.
             guard isSourceWindowOnScreen(sourceWindowID) else {
-                hidePanelImmediately(reason: "source window is not on screen")
+                suspendPreviewAndCapture(reason: "source window is not on screen")
+                // A relaunched iPhone Mirroring app can have a different window
+                // ID. If it has a visible interactive window, rediscover it.
+                if mirroringController.isTargetWindowInteractive() {
+                    requestCaptureStart()
+                }
                 return
             }
+
+            requestCaptureStart()
 
             guard let frame = quartzFrame(for: sourceWindowID) else { return }
             panel?.setFrame(convertQuartzFrameToAppKit(frame), display: true)
@@ -968,7 +1064,7 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
     private func activateIPhoneMirroring() {
         guard let sourceWindowID, isSourceWindowOnScreen(sourceWindowID),
               mirroringController.isTargetWindowInteractive() else {
-            hidePanelImmediately(reason: "ignored click on suspended source")
+            suspendPreviewAndCapture(reason: "ignored click on suspended source")
             return
         }
         let activated = mirroringController.activateTargetApplication()
