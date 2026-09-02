@@ -1858,7 +1858,12 @@ final class MouseEventMonitor {
             let validShareAction = pageKind == .share
                 && (recipientIndex != nil || isShareSendKey)
             let validShareClose = pageKind == .share && isShareKey
-            let validFeedAction = pageKind == .video
+            // Animated captions and bullet comments can make Vision miss 首页
+            // or 推荐 for a single frame. Accept the short, confirmed-video
+            // grace period here as well as for hide/minimize. Direct clicks and
+            // ordinary typing invalidate that grace immediately, and detecting
+            // the share sheet clears it, so search/chat input remains untouched.
+            let validFeedAction = pageContextDetector.isVideoPageOrRecentlyConfirmed()
                 && (isArrowControlKey || isSpaceControlKey || isLikeOrShareKey)
             guard validFeedAction || validShareAction || validShareClose else {
                 shareSelectionStartedUptime = nil
@@ -1989,7 +1994,7 @@ final class MouseEventMonitor {
             return Unmanaged.passUnretained(event)
         }
 
-        guard pageContextDetector.currentPageKind() == .video else {
+        guard pageContextDetector.isVideoPageOrRecentlyConfirmed() else {
             // Side buttons also remain untouched in chat and other iPhone pages.
             return Unmanaged.passUnretained(event)
         }
