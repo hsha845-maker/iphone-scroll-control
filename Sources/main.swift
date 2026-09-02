@@ -87,6 +87,8 @@ struct Config {
     var shareSendSingleXRatio: CGFloat = 0.50
     var shareSendMultipleXRatio: CGFloat = 0.73
     var shareSendYRatio: CGFloat = 0.92
+    var shareCloseXRatio: CGFloat = 0.91
+    var shareCloseYRatio: CGFloat = 0.67
     var shareSendKeyCodes: Set<Int64> = [36, 76] // Return, keypad Enter
     // Give iPhone Mirroring time to finish becoming key/frontmost before the
     // first synthetic scroll after clicking the floating preview.
@@ -573,6 +575,7 @@ final class PageContextDetector {
     private let config: Config
     private let lock = NSLock()
     private var pageKind: MirroredPageKind = .unknown
+    private var multipleShareSendButtonVisible = false
     private var lastAnalysisUptime: TimeInterval = 0
     private var analysisInProgress = false
 
@@ -586,10 +589,17 @@ final class PageContextDetector {
         return pageKind
     }
 
+    func shareUsesMultipleSendButton() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return multipleShareSendButtonVisible
+    }
+
     func invalidate(reason: String) {
         lock.lock()
         let changed = pageKind != .other
         pageKind = .other
+        multipleShareSendButtonVisible = false
         lock.unlock()
         if changed {
             print("Mirrored-page shortcuts suspended: \(reason).")
@@ -661,6 +671,7 @@ final class PageContextDetector {
         lock.lock()
         let changed = detected != pageKind
         pageKind = detected
+        multipleShareSendButtonVisible = isShareSheet && compact.contains("分别发送")
         lock.unlock()
         if changed {
             print("Detected mirrored page: \(detected.rawValue); OCR = \(recognizedText.prefix(180))")
@@ -1164,9 +1175,45 @@ final class SwipeController {
                 y: frame.minY + frame.height * config.middleClickYRatio
             )
             print("Performing center click:\n  window = \(frameDescription(frame))\n  point = \(pointDescription(point))")
-            postMouse(type: .leftMouseDown, point: point, button: .left)
+            postMouse(
+                type: .leftMouseDown,
+                point: point,
+                button: .left,
+                replayMarker: syntheticReplayMarker
+            )
             usleep(40_000)
-            postMouse(type: .leftMouseUp, point: point, button: .left)
+            postMouse(
+                type: .leftMouseUp,
+                point: point,
+                button: .left,
+                replayMarker: syntheticReplayMarker
+            )
+        }
+    }
+
+    func performSystemShortcut(keyCode: Int64) {
+        gestureQueue.async { [self] in
+            print("Performing Command shortcut without playback click, keyCode = \(keyCode).")
+            postCommandShortcut(keyCode: keyCode)
+        }
+    }
+
+    func performWindowButtonClick(at buttonPoint: CGPoint) {
+        gestureQueue.async { [self] in
+            print("Clicking window button without playback click.")
+            postMouse(
+                type: .leftMouseDown,
+                point: buttonPoint,
+                button: .left,
+                replayMarker: syntheticReplayMarker
+            )
+            usleep(40_000)
+            postMouse(
+                type: .leftMouseUp,
+                point: buttonPoint,
+                button: .left,
+                replayMarker: syntheticReplayMarker
+            )
         }
     }
 
@@ -1238,9 +1285,11 @@ final class SwipeController {
         gestureQueue.async { [self] in
             mirroringController.waitForActivationToSettle()
             print("Relaying activation click to iPhone Mirroring at \(pointDescription(point)).")
-            postMouse(type: .leftMouseDown, point: point, button: .left)
+            postMouse(type: .leftMouseDown, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
             usleep(40_000)
-            postMouse(type: .leftMouseUp, point: point, button: .left)
+            postMouse(type: .leftMouseUp, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
         }
     }
 
@@ -1250,11 +1299,15 @@ final class SwipeController {
             guard let frame = mirroringController.focusedWindowFrame(of: app) else { return }
             let point = CGPoint(x: frame.midX, y: frame.midY)
             print("Performing double-click like at \(pointDescription(point)).")
-            postMouse(type: .leftMouseDown, point: point, button: .left, clickState: 1)
-            postMouse(type: .leftMouseUp, point: point, button: .left, clickState: 1)
+            postMouse(type: .leftMouseDown, point: point, button: .left,
+                      clickState: 1, replayMarker: syntheticReplayMarker)
+            postMouse(type: .leftMouseUp, point: point, button: .left,
+                      clickState: 1, replayMarker: syntheticReplayMarker)
             usleep(90_000)
-            postMouse(type: .leftMouseDown, point: point, button: .left, clickState: 2)
-            postMouse(type: .leftMouseUp, point: point, button: .left, clickState: 2)
+            postMouse(type: .leftMouseDown, point: point, button: .left,
+                      clickState: 2, replayMarker: syntheticReplayMarker)
+            postMouse(type: .leftMouseUp, point: point, button: .left,
+                      clickState: 2, replayMarker: syntheticReplayMarker)
         }
     }
 
@@ -1266,9 +1319,27 @@ final class SwipeController {
                 y: frame.minY + frame.height * config.shareButtonYRatio
             )
             print("Opening share sheet at \(pointDescription(point)).")
-            postMouse(type: .leftMouseDown, point: point, button: .left)
+            postMouse(type: .leftMouseDown, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
             usleep(40_000)
-            postMouse(type: .leftMouseUp, point: point, button: .left)
+            postMouse(type: .leftMouseUp, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
+        }
+    }
+
+    func closeShareSheet(app: NSRunningApplication) {
+        gestureQueue.async { [self] in
+            guard let frame = mirroringController.focusedWindowFrame(of: app) else { return }
+            let point = CGPoint(
+                x: frame.minX + frame.width * config.shareCloseXRatio,
+                y: frame.minY + frame.height * config.shareCloseYRatio
+            )
+            print("Closing share sheet at \(pointDescription(point)).")
+            postMouse(type: .leftMouseDown, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
+            usleep(40_000)
+            postMouse(type: .leftMouseUp, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
         }
     }
 
@@ -1281,9 +1352,11 @@ final class SwipeController {
                 y: frame.minY + frame.height * config.shareRecipientYRatio
             )
             print("Selecting share recipient \(index + 1) at \(pointDescription(point)).")
-            postMouse(type: .leftMouseDown, point: point, button: .left)
+            postMouse(type: .leftMouseDown, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
             usleep(40_000)
-            postMouse(type: .leftMouseUp, point: point, button: .left)
+            postMouse(type: .leftMouseUp, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
         }
     }
 
@@ -1299,9 +1372,11 @@ final class SwipeController {
                 y: frame.minY + frame.height * config.shareSendYRatio
             )
             print("Sending shared video to \(selectionCount) recipient(s) at \(pointDescription(point)).")
-            postMouse(type: .leftMouseDown, point: point, button: .left)
+            postMouse(type: .leftMouseDown, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
             usleep(40_000)
-            postMouse(type: .leftMouseUp, point: point, button: .left)
+            postMouse(type: .leftMouseUp, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
         }
     }
 
@@ -1323,7 +1398,8 @@ final class SwipeController {
 
         print("Performing swipe:\n  direction = \(direction.rawValue)\n  window = \(frameDescription(frame))\n  start = \(pointDescription(start))\n  end = \(pointDescription(end))")
 
-        postMouse(type: .leftMouseDown, point: start, button: .left)
+        postMouse(type: .leftMouseDown, point: start, button: .left,
+                  replayMarker: syntheticReplayMarker)
         for step in 1...steps {
             let progress = CGFloat(step) / CGFloat(steps)
             // Smoothstep avoids an unnaturally constant drag velocity.
@@ -1332,12 +1408,14 @@ final class SwipeController {
                 x: start.x + (end.x - start.x) * eased,
                 y: start.y + (end.y - start.y) * eased
             )
-            postMouse(type: .leftMouseDragged, point: point, button: .left)
+            postMouse(type: .leftMouseDragged, point: point, button: .left,
+                      replayMarker: syntheticReplayMarker)
             if stepDelay > 0 {
                 usleep(useconds_t(stepDelay * 1_000_000))
             }
         }
-        postMouse(type: .leftMouseUp, point: end, button: .left)
+        postMouse(type: .leftMouseUp, point: end, button: .left,
+                  replayMarker: syntheticReplayMarker)
     }
 
     private func performScroll(_ direction: SwipeDirection, in frame: CGRect) {
@@ -1444,6 +1522,10 @@ final class MouseEventMonitor {
     private var lastKeyboardTriggerByKey: [Int64: TimeInterval] = [:]
     private var shareSelectionStartedUptime: TimeInterval?
     private var selectedShareRecipients: Set<Int> = []
+    // Douyin normally starts a feed video automatically. Keep this state in
+    // sync with Space, navigation, and direct taps so hide/minimize is
+    // idempotent: it pauses only when playback is currently active.
+    private var videoIsPlaying = true
     private var needsContentFocusBeforeSwipe = true
     private var workspaceActivationObserver: NSObjectProtocol?
 
@@ -1546,10 +1628,16 @@ final class MouseEventMonitor {
                 object: nil
             )
             consumeNextLeftMouseUp = true
-            swipeController.pauseThenPerformWindowButtonClick(
-                at: event.location,
-                app: targetApp
-            )
+            if videoIsPlaying {
+                videoIsPlaying = false
+                swipeController.pauseThenPerformWindowButtonClick(
+                    at: event.location,
+                    app: targetApp
+                )
+            } else {
+                print("Video already paused; minimizing without a playback click.")
+                swipeController.performWindowButtonClick(at: event.location)
+            }
             return nil
         }
 
@@ -1562,6 +1650,7 @@ final class MouseEventMonitor {
            frame.contains(event.location) {
             consumeNextLeftMouseUp = true
             let clickPoint = event.location
+            updatePlaybackStateForUserClick(at: clickPoint, in: frame)
             let activated = mirroringController.activateTargetApplication()
             swipeController.performFocusClick(at: clickPoint)
             print(
@@ -1580,6 +1669,7 @@ final class MouseEventMonitor {
            let targetApp = mirroringController.frontmostTargetApplication(),
            let frame = mirroringController.focusedWindowFrame(of: targetApp),
            frame.contains(event.location) {
+            updatePlaybackStateForUserClick(at: event.location, in: frame)
             pageContextDetector.invalidate(reason: "direct interaction with iPhone Mirroring")
             shareSelectionStartedUptime = nil
             selectedShareRecipients.removeAll()
@@ -1603,10 +1693,16 @@ final class MouseEventMonitor {
                         object: nil
                     )
                     consumedKeyboardKeyUps.insert(keyCode)
-                    swipeController.pauseThenPerformSystemShortcut(
-                        keyCode: keyCode,
-                        app: targetApp
-                    )
+                    if videoIsPlaying {
+                        videoIsPlaying = false
+                        swipeController.pauseThenPerformSystemShortcut(
+                            keyCode: keyCode,
+                            app: targetApp
+                        )
+                    } else {
+                        print("Video already paused; hiding/minimizing without a playback click.")
+                        swipeController.performSystemShortcut(keyCode: keyCode)
+                    }
                     return nil
                 }
                 return Unmanaged.passUnretained(event)
@@ -1681,9 +1777,10 @@ final class MouseEventMonitor {
             // timeout alone must never consume input on search or chat pages.
             let validShareAction = pageKind == .share
                 && (recipientIndex != nil || isShareSendKey)
+            let validShareClose = pageKind == .share && isShareKey
             let validFeedAction = pageKind == .video
                 && (isArrowControlKey || isSpaceControlKey || isLikeOrShareKey)
-            guard validFeedAction || validShareAction else {
+            guard validFeedAction || validShareAction || validShareClose else {
                 shareSelectionStartedUptime = nil
                 selectedShareRecipients.removeAll()
                 print("Keyboard key passed through: shortcut is not enabled on this page.")
@@ -1715,7 +1812,12 @@ final class MouseEventMonitor {
             }
             lastKeyboardTriggerByKey[keyCode] = now
 
-            if let recipientIndex, validShareAction {
+            if validShareClose {
+                shareSelectionStartedUptime = nil
+                selectedShareRecipients.removeAll()
+                print("Arrow key: Right -> close share sheet")
+                swipeController.closeShareSheet(app: targetApp)
+            } else if let recipientIndex, validShareAction {
                 shareSelectionStartedUptime = now
                 if selectedShareRecipients.contains(recipientIndex) {
                     selectedShareRecipients.remove(recipientIndex)
@@ -1728,6 +1830,7 @@ final class MouseEventMonitor {
                 )
                 swipeController.selectShareRecipient(recipientIndex, app: targetApp)
             } else if isNextVideoKey && !validShareAction {
+                videoIsPlaying = true
                 shareSelectionStartedUptime = nil
                 selectedShareRecipients.removeAll()
                 print("Arrow key: Down -> next video")
@@ -1739,6 +1842,7 @@ final class MouseEventMonitor {
                     ensureContentFocus: restoreFocus
                 )
             } else if isPreviousVideoKey {
+                videoIsPlaying = true
                 shareSelectionStartedUptime = nil
                 selectedShareRecipients.removeAll()
                 print("Arrow key: Up -> previous video")
@@ -1752,7 +1856,8 @@ final class MouseEventMonitor {
             } else if keyCode == config.playPauseKeyCode {
                 shareSelectionStartedUptime = nil
                 selectedShareRecipients.removeAll()
-                print("Space key -> play/pause")
+                videoIsPlaying.toggle()
+                print("Space key -> play/pause; now playing = \(videoIsPlaying)")
                 swipeController.performCenterClick(app: targetApp)
             } else if isLikeKey {
                 shareSelectionStartedUptime = nil
@@ -1777,16 +1882,16 @@ final class MouseEventMonitor {
                 )
                 swipeController.selectShareRecipient(recipientIndex, app: targetApp)
             } else if isShareSendKey {
-                let count = selectedShareRecipients.count
-                if count > 0 {
-                    print("Enter -> send shared video to \(count) recipient(s)")
-                    swipeController.sendSharedVideo(selectionCount: count, app: targetApp)
-                    needsContentFocusBeforeSwipe = true
-                    shareSelectionStartedUptime = nil
-                    selectedShareRecipients.removeAll()
-                } else {
-                    print("Enter ignored: no share recipient is selected.")
-                }
+                // A recipient may have been selected with the mouse, so the
+                // local set can be empty even while the red button is enabled.
+                // OCR distinguishes the two-button multi-send layout.
+                let detectedCount = pageContextDetector.shareUsesMultipleSendButton() ? 2 : 1
+                let count = max(selectedShareRecipients.count, detectedCount)
+                print("Enter -> click share send button; inferred recipients = \(count)")
+                swipeController.sendSharedVideo(selectionCount: count, app: targetApp)
+                needsContentFocusBeforeSwipe = true
+                shareSelectionStartedUptime = nil
+                selectedShareRecipients.removeAll()
             }
             return nil
         }
@@ -1829,6 +1934,7 @@ final class MouseEventMonitor {
         lastTriggerByButton[button] = now
 
         if button == config.nextButton {
+            videoIsPlaying = true
             let restoreFocus = needsContentFocusBeforeSwipe
             needsContentFocusBeforeSwipe = false
             swipeController.performSwipe(
@@ -1837,6 +1943,7 @@ final class MouseEventMonitor {
                 ensureContentFocus: restoreFocus
             )
         } else if button == config.previousButton {
+            videoIsPlaying = true
             let restoreFocus = needsContentFocusBeforeSwipe
             needsContentFocusBeforeSwipe = false
             swipeController.performSwipe(
@@ -1845,10 +1952,23 @@ final class MouseEventMonitor {
                 ensureContentFocus: restoreFocus
             )
         } else if config.enableMiddleClickPlayPause && button == config.middleButton {
+            videoIsPlaying.toggle()
             swipeController.performCenterClick(app: targetApp)
         }
 
         return nil
+    }
+
+    private func updatePlaybackStateForUserClick(at point: CGPoint, in frame: CGRect) {
+        guard pageContextDetector.currentPageKind() == .video,
+              frame.width > 0, frame.height > 0 else { return }
+        let x = (point.x - frame.minX) / frame.width
+        let y = (point.y - frame.minY) / frame.height
+        // Exclude top navigation, bottom tabs, and the right-side action rail.
+        // A single tap in the main video body toggles Douyin playback.
+        guard (0.20...0.80).contains(x), (0.25...0.65).contains(y) else { return }
+        videoIsPlaying.toggle()
+        print("Direct video tap; now playing = \(videoIsPlaying).")
     }
 
     private func isTargetFrontmostWithoutLogging() -> Bool {
