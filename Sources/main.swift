@@ -94,6 +94,9 @@ struct Config {
     // first synthetic scroll after clicking the floating preview.
     var activationSettleInterval: TimeInterval = 0.70
     var videoPageRecognitionInterval: TimeInterval = 0.45
+    // While the user is composing text (especially with a Chinese input
+    // method), Space/arrows/numbers must reach the input method unchanged.
+    var textInputProtectionInterval: TimeInterval = 2.0
 
     // The program always prints the real frontmost name and bundle identifier.
     // Add the printed bundle identifier here for the strictest match.
@@ -578,6 +581,9 @@ final class PageContextDetector {
     private var multipleShareSendButtonVisible = false
     private var lastAnalysisUptime: TimeInterval = 0
     private var analysisInProgress = false
+    // Prevent an OCR request that began before a click/keystroke invalidation
+    // from restoring a stale page classification after it finishes.
+    private var contextRevision: UInt64 = 0
 
     init(config: Config) {
         self.config = config
@@ -600,6 +606,7 @@ final class PageContextDetector {
         let changed = pageKind != .other
         pageKind = .other
         multipleShareSendButtonVisible = false
+        contextRevision &+= 1
         lock.unlock()
         if changed {
             print("Mirrored-page shortcuts suspended: \(reason).")
@@ -616,6 +623,7 @@ final class PageContextDetector {
         }
         analysisInProgress = true
         lastAnalysisUptime = now
+        let analysisRevision = contextRevision
         lock.unlock()
 
         defer {
@@ -641,16 +649,43 @@ final class PageContextDetector {
             return
         }
 
-        let recognizedText = (request.results ?? [])
-            .compactMap { $0.topCandidates(1).first?.string }
-            .joined(separator: " ")
+        let observations = request.results ?? []
+        let recognizedItems = observations.compactMap {
+            observation -> (text: String, candidate: VNRecognizedText, box: CGRect)? in
+            guard let candidate = observation.topCandidates(1).first else { return nil }
+            return (
+                candidate.string.replacingOccurrences(of: " ", with: ""),
+                candidate,
+                observation.boundingBox
+            )
+        }
+        let recognizedText = recognizedItems.map(\.text).joined(separator: " ")
         let compact = recognizedText.replacingOccurrences(of: " ", with: "")
 
-        // Global playback shortcuts are intentionally conservative: both the
-        // bottom 首页 tab and the selected top 推荐 tab must be visible. Search,
-        // chat, profile, and every other screen therefore keep normal typing.
-        let isHomeRecommendedFeed = compact.contains("首页")
-            && compact.contains("推荐")
+        func containsToken(
+            _ token: String,
+            xRange: ClosedRange<CGFloat>,
+            yRange: ClosedRange<CGFloat>
+        ) -> Bool {
+            recognizedItems.contains { item in
+                guard let range = item.candidate.string.range(of: token) else { return false }
+                let tokenBox = ((try? item.candidate.boundingBox(for: range))?.boundingBox)
+                    ?? item.box
+                return xRange.contains(tokenBox.midX) && yRange.contains(tokenBox.midY)
+            }
+        }
+
+        // Vision uses normalized coordinates with the origin at bottom-left.
+        // Require 首页 in the bottom-left navigation area and 推荐 in the upper
+        // tab row. Merely finding those words somewhere in search results is
+        // not enough to enable shortcuts.
+        let hasBottomHomeTab = containsToken(
+            "首页", xRange: 0.00...0.32, yRange: 0.00...0.18
+        )
+        let hasTopRecommendedTab = containsToken(
+            "推荐", xRange: 0.52...1.00, yRange: 0.78...1.00
+        )
+        let isHomeRecommendedFeed = hasBottomHomeTab && hasTopRecommendedTab
 
         // Detect the share sheet independently so it also works when the user
         // opens it by clicking the UI rather than with Right Arrow. Evaluate it
@@ -669,6 +704,11 @@ final class PageContextDetector {
         }
 
         lock.lock()
+        guard contextRevision == analysisRevision else {
+            lock.unlock()
+            print("Discarded stale mirrored-page recognition result.")
+            return
+        }
         let changed = detected != pageKind
         pageKind = detected
         multipleShareSendButtonVisible = isShareSheet && compact.contains("分别发送")
@@ -1522,6 +1562,7 @@ final class MouseEventMonitor {
     private var lastKeyboardTriggerByKey: [Int64: TimeInterval] = [:]
     private var shareSelectionStartedUptime: TimeInterval?
     private var selectedShareRecipients: Set<Int> = []
+    private var textInputProtectionUntil: TimeInterval = 0
     // Douyin normally starts a feed video automatically. Keep this state in
     // sync with Space, navigation, and direct taps so hide/minimize is
     // idempotent: it pauses only when playback is currently active.
@@ -1740,6 +1781,8 @@ final class MouseEventMonitor {
             if type == .keyDown,
                !isPotentialControlKey,
                mirroringController.frontmostTargetApplication() != nil {
+                textInputProtectionUntil = ProcessInfo.processInfo.systemUptime
+                    + config.textInputProtectionInterval
                 pageContextDetector.invalidate(reason: "ordinary keyboard input")
                 shareSelectionStartedUptime = nil
                 selectedShareRecipients.removeAll()
@@ -1765,6 +1808,22 @@ final class MouseEventMonitor {
                 now - $0 < config.shareSelectionTimeout
             } ?? false
             let pageKind = pageContextDetector.currentPageKind()
+
+            // A Chinese input method uses Space to commit the current
+            // candidate and arrows/numbers to choose candidates. Once ordinary
+            // typing is observed, pass all of those keys through for a short
+            // quiet period. The share sheet is exempt because its 1-5/Enter
+            // controls are deliberately enabled there.
+            if now < textInputProtectionUntil, pageKind != .share {
+                let remaining = textInputProtectionUntil - now
+                print(
+                    String(
+                        format: "Keyboard key passed through: text input protection active (%.2fs remaining).",
+                        remaining
+                    )
+                )
+                return Unmanaged.passUnretained(event)
+            }
 
             print(
                 "Keyboard control key down: code = \(keyCode), "
