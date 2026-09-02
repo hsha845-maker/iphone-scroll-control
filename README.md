@@ -2,7 +2,7 @@
 
 一个轻量级原生 macOS 工具，用 Logitech 鼠标侧键和键盘快捷键控制「iPhone Mirroring / iPhone 镜像」中的抖音视频。
 
-当前版本：**1.1.3**
+当前版本：**1.1.4**
 系统要求：macOS 15 或更高版本
 架构：Apple Silicon（arm64）与 Intel（x86_64）
 
@@ -10,13 +10,13 @@
 
 | 输入 | 功能 | 生效条件 |
 | --- | --- | --- |
-| Logitech G309 后侧键 | 下一条视频 | iPhone Mirroring 前台、视频页 |
-| Logitech G309 前侧键 | 上一条视频 | iPhone Mirroring 前台、视频页 |
-| `↓` / `↑` | 下一条 / 上一条 | 已识别为视频页 |
-| `Space` | 播放或暂停 | 已识别为视频页 |
-| `←` | 双击点赞 | 已识别为视频页 |
-| `→` | 打开分享面板 | 已识别为视频页 |
-| `1`–`5` | 选择前五位联系人，可多选 | 分享面板已打开 |
+| Logitech G309 后侧键 | 下一条视频 | iPhone Mirroring 前台、同时看到“首页”和“推荐” |
+| Logitech G309 前侧键 | 上一条视频 | iPhone Mirroring 前台、同时看到“首页”和“推荐” |
+| `↓` / `↑` | 下一条 / 上一条 | 同时识别到“首页”和“推荐” |
+| `Space` | 播放或暂停 | 同时识别到“首页”和“推荐” |
+| `←` | 双击点赞 | 同时识别到“首页”和“推荐” |
+| `→` | 打开分享面板 | 同时识别到“首页”和“推荐” |
+| `1`–`5` | 选择前五位联系人，可多选 | 已识别到“分享给”弹窗 |
 | `Enter` | 点击发送 | 已选择至少一位联系人 |
 | `Command + M` | 先暂停，再最小化 | 已识别为视频页 |
 | `Command + H` | 先暂停，再隐藏 | 已识别为视频页 |
@@ -32,15 +32,15 @@
 
 ## 安全与输入保护
 
-- 快捷键只在真实 iPhone Mirroring 位于前台、且 Vision 识别为抖音视频页时生效。
+- 视频快捷键只在真实 iPhone Mirroring 位于前台、且 Vision 同时识别到“首页”和“推荐”时生效。
 - 聊天页、搜索页以及识别不明确的页面会放行普通键盘输入。
 - 离开 iPhone Mirroring 后，鼠标侧键保留浏览器前进、后退等原有功能。
-- 分享数字键只有在按 `→` 打开分享面板后的短时间内才会被拦截。
+- 分享数字键与 Enter 只有识别到“分享给”弹窗时才会被拦截；手动点击打开分享也支持。
 - 屏幕捕获仅针对 iPhone Mirroring 单个窗口，不捕获系统音频。
 
 ## 安装发布版
 
-从 GitHub Releases 下载 `iPhone-Scroll-Control-1.1.3-macOS.dmg`：
+从 GitHub Releases 下载 `iPhone-Scroll-Control-1.1.4-macOS.dmg`：
 
 1. 打开 DMG。
 2. 按住 Control 点击“安装.command”，选择“打开”。
@@ -79,7 +79,7 @@ build/iPhone Scroll Control.app
 输出位置：
 
 ```text
-dist/iPhone-Scroll-Control-1.1.3-macOS.dmg
+dist/iPhone-Scroll-Control-1.1.4-macOS.dmg
 ```
 
 运行静态检查：

@@ -91,7 +91,7 @@ struct Config {
     // Give iPhone Mirroring time to finish becoming key/frontmost before the
     // first synthetic scroll after clicking the floating preview.
     var activationSettleInterval: TimeInterval = 0.70
-    var videoPageRecognitionInterval: TimeInterval = 0.80
+    var videoPageRecognitionInterval: TimeInterval = 0.45
 
     // The program always prints the real frontmost name and bundle identifier.
     // Add the printed bundle identifier here for the strictest match.
@@ -565,6 +565,7 @@ final class AlwaysOnTopController {
 enum MirroredPageKind: String {
     case unknown
     case video
+    case share
     case other
 }
 
@@ -583,6 +584,16 @@ final class PageContextDetector {
         lock.lock()
         defer { lock.unlock() }
         return pageKind
+    }
+
+    func invalidate(reason: String) {
+        lock.lock()
+        let changed = pageKind != .other
+        pageKind = .other
+        lock.unlock()
+        if changed {
+            print("Mirrored-page shortcuts suspended: \(reason).")
+        }
     }
 
     func inspect(_ sampleBuffer: CMSampleBuffer) {
@@ -625,31 +636,27 @@ final class PageContextDetector {
             .joined(separator: " ")
         let compact = recognizedText.replacingOccurrences(of: " ", with: "")
 
-        // The Douyin feed keeps several of these navigation labels visible.
-        // Conversation/detail screens do not, so default to non-video for
-        // keyboard safety whenever the evidence is insufficient.
-        let feedNavigation = ["推荐", "关注", "同城", "商城", "直播"]
-        let feedHits = feedNavigation.filter { compact.contains($0) }.count
-        // Message pages often contain words such as “朋友 / 消息 / 我” in
-        // ordinary conversation text. Only the feed's top navigation is a
-        // sufficiently strong signal for enabling global shortcuts.
-        let hasFeedTopNavigation = feedHits >= 2
-            && (compact.contains("推荐") || compact.contains("关注"))
+        // Global playback shortcuts are intentionally conservative: both the
+        // bottom 首页 tab and the selected top 推荐 tab must be visible. Search,
+        // chat, profile, and every other screen therefore keep normal typing.
+        let isHomeRecommendedFeed = compact.contains("首页")
+            && compact.contains("推荐")
 
-        // Text recognition can temporarily miss the top navigation when a
-        // video is bright, animated, or covered by captions. These controls
-        // are specific to the feed/detail presentation and remain visible in
-        // those cases. Requiring 首页 as well prevents ordinary chat text
-        // containing words such as “分享” or “评论” from enabling shortcuts.
-        let feedBodyMarkers = [
-            "相关搜索", "拍同款", "全屏观看", "作者声明", "点击推荐", "分享给"
-        ]
-        let feedBodyHits = feedBodyMarkers.filter { compact.contains($0) }.count
-        let hasFeedBody = compact.contains("首页") && feedBodyHits >= 1
+        // Detect the share sheet independently so it also works when the user
+        // opens it by clicking the UI rather than with Right Arrow. Evaluate it
+        // before the feed because 推荐 can remain visible behind the sheet.
+        let shareMarkers = ["最近分享", "转发到日常", "私信", "分享至群", "分别发送"]
+        let shareMarkerHits = shareMarkers.filter { compact.contains($0) }.count
+        let isShareSheet = compact.contains("分享给") && shareMarkerHits >= 1
 
-        let detected: MirroredPageKind = (hasFeedTopNavigation || hasFeedBody)
-            ? .video
-            : .other
+        let detected: MirroredPageKind
+        if isShareSheet {
+            detected = .share
+        } else if isHomeRecommendedFeed {
+            detected = .video
+        } else {
+            detected = .other
+        }
 
         lock.lock()
         let changed = detected != pageKind
@@ -1565,6 +1572,19 @@ final class MouseEventMonitor {
             return nil
         }
 
+        // Any direct interaction with the mirrored iPhone can navigate away
+        // from the feed (for example, tapping Search or Messages). Disable
+        // shortcuts immediately; OCR may enable the precise page again only
+        // after both 首页 and 推荐 are visible.
+        if type == .leftMouseDown,
+           let targetApp = mirroringController.frontmostTargetApplication(),
+           let frame = mirroringController.focusedWindowFrame(of: targetApp),
+           frame.contains(event.location) {
+            pageContextDetector.invalidate(reason: "direct interaction with iPhone Mirroring")
+            shareSelectionStartedUptime = nil
+            selectedShareRecipients.removeAll()
+        }
+
         if type == .keyDown || type == .keyUp {
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
 
@@ -1615,9 +1635,21 @@ final class MouseEventMonitor {
             let recipientIndex = config.shareRecipientKeyCodes[keyCode]
             let isShareSendKey = config.shareSendKeyCodes.contains(keyCode)
 
-            guard isArrowControlKey || isSpaceControlKey
-                    || isLikeOrShareKey || recipientIndex != nil
-                    || isShareSendKey else {
+            let isPotentialControlKey = isArrowControlKey || isSpaceControlKey
+                || isLikeOrShareKey || recipientIndex != nil || isShareSendKey
+
+            // Ordinary typing is another strong sign that the user is in a
+            // text field. Suspend first so a following Space or arrow key is
+            // guaranteed to remain normal input while OCR catches up.
+            if type == .keyDown,
+               !isPotentialControlKey,
+               mirroringController.frontmostTargetApplication() != nil {
+                pageContextDetector.invalidate(reason: "ordinary keyboard input")
+                shareSelectionStartedUptime = nil
+                selectedShareRecipients.removeAll()
+            }
+
+            guard isPotentialControlKey else {
                 return Unmanaged.passUnretained(event)
             }
 
@@ -1636,22 +1668,25 @@ final class MouseEventMonitor {
             let shareSelectionIsActive = shareSelectionStartedUptime.map {
                 now - $0 < config.shareSelectionTimeout
             } ?? false
+            let pageKind = pageContextDetector.currentPageKind()
 
             print(
                 "Keyboard control key down: code = \(keyCode), "
-                    + "page = \(pageContextDetector.currentPageKind().rawValue), "
+                    + "page = \(pageKind.rawValue), "
                     + "share active = \(shareSelectionIsActive)"
             )
 
-            // Safety rule: unless a numbered share choice is pending, intercept
-            // nothing outside a positively recognized Douyin video-feed page.
-            let validShareAction = shareSelectionIsActive
+            // Playback controls require the exact 首页 + 推荐 feed. Recipient
+            // numbers and Enter require the share sheet to be visible; a stale
+            // timeout alone must never consume input on search or chat pages.
+            let validShareAction = pageKind == .share
                 && (recipientIndex != nil || isShareSendKey)
-            guard pageContextDetector.currentPageKind() == .video
-                    || validShareAction else {
+            let validFeedAction = pageKind == .video
+                && (isArrowControlKey || isSpaceControlKey || isLikeOrShareKey)
+            guard validFeedAction || validShareAction else {
                 shareSelectionStartedUptime = nil
                 selectedShareRecipients.removeAll()
-                print("Keyboard key passed through: mirrored page is not the video feed.")
+                print("Keyboard key passed through: shortcut is not enabled on this page.")
                 return Unmanaged.passUnretained(event)
             }
 
