@@ -66,7 +66,9 @@ struct Config {
     var pauseBeforeMinimizeOrHide: Bool = true
     var minimizeKeyCode: Int64 = 46 // Command-M
     var hideKeyCode: Int64 = 4      // Command-H
-    var pauseBeforeWindowActionDelay: TimeInterval = 0.12
+    // Give Douyin enough time to commit the pause before macOS removes the
+    // mirrored surface. A very short delay can leave audio playing after hide.
+    var pauseBeforeWindowActionDelay: TimeInterval = 0.35
     var enableLikeAndShareKeys: Bool = true
     var likeKeyCode: Int64 = 123       // Left Arrow
     var shareKeyCode: Int64 = 124      // Right Arrow
@@ -94,6 +96,9 @@ struct Config {
     // first synthetic scroll after clicking the floating preview.
     var activationSettleInterval: TimeInterval = 0.70
     var videoPageRecognitionInterval: TimeInterval = 0.45
+    // OCR can miss one frame while captions animate. Window actions may still
+    // use a recent positive feed result unless direct input invalidated it.
+    var videoRecognitionGraceInterval: TimeInterval = 3.0
     // While the user is composing text (especially with a Chinese input
     // method), Space/arrows/numbers must reach the input method unchanged.
     var textInputProtectionInterval: TimeInterval = 2.0
@@ -584,6 +589,7 @@ final class PageContextDetector {
     // Prevent an OCR request that began before a click/keystroke invalidation
     // from restoring a stale page classification after it finishes.
     private var contextRevision: UInt64 = 0
+    private var lastConfirmedVideoUptime: TimeInterval = 0
 
     init(config: Config) {
         self.config = config
@@ -601,11 +607,21 @@ final class PageContextDetector {
         return multipleShareSendButtonVisible
     }
 
+    func isVideoPageOrRecentlyConfirmed() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if pageKind == .video { return true }
+        guard lastConfirmedVideoUptime > 0 else { return false }
+        return ProcessInfo.processInfo.systemUptime - lastConfirmedVideoUptime
+            <= config.videoRecognitionGraceInterval
+    }
+
     func invalidate(reason: String) {
         lock.lock()
         let changed = pageKind != .other
         pageKind = .other
         multipleShareSendButtonVisible = false
+        lastConfirmedVideoUptime = 0
         contextRevision &+= 1
         lock.unlock()
         if changed {
@@ -712,6 +728,11 @@ final class PageContextDetector {
         let changed = detected != pageKind
         pageKind = detected
         multipleShareSendButtonVisible = isShareSheet && compact.contains("分别发送")
+        if detected == .video {
+            lastConfirmedVideoUptime = ProcessInfo.processInfo.systemUptime
+        } else if detected == .share {
+            lastConfirmedVideoUptime = 0
+        }
         lock.unlock()
         if changed {
             print("Detected mirrored page: \(detected.rawValue); OCR = \(recognizedText.prefix(180))")
@@ -1661,7 +1682,7 @@ final class MouseEventMonitor {
         if type == .leftMouseDown,
            config.pauseBeforeMinimizeOrHide,
            let targetApp = mirroringController.frontmostTargetApplication(),
-           pageContextDetector.currentPageKind() == .video,
+           pageContextDetector.isVideoPageOrRecentlyConfirmed(),
            let minimizeFrame = mirroringController.minimizeButtonFrame(of: targetApp),
            minimizeFrame.insetBy(dx: -5, dy: -5).contains(event.location) {
             NotificationCenter.default.post(
@@ -1728,7 +1749,7 @@ final class MouseEventMonitor {
                     return Unmanaged.passUnretained(event)
                 }
                 if let targetApp = mirroringController.frontmostTargetApplication(),
-                   pageContextDetector.currentPageKind() == .video {
+                   pageContextDetector.isVideoPageOrRecentlyConfirmed() {
                     NotificationCenter.default.post(
                         name: .iPhoneScrollControlWillSuspendTarget,
                         object: nil
