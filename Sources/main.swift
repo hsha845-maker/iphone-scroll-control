@@ -33,6 +33,11 @@ struct Config {
     var scrollLineDelta: Int32 = 10
     var scrollBurstCount: Int = 18
     var scrollBurstDuration: TimeInterval = 0.24
+    // TikTok needs one continuous gesture rather than independent wheel ticks.
+    var tikTokScrollHeightRatio: CGFloat = 1.60
+    var tikTokScrollDuration: TimeInterval = 0.25
+    var tikTokWheelPaging: Bool = true
+    var tikTokWheelQuietInterval: TimeInterval = 0.65
     // Change to -1 if the resulting scroll direction is reversed on your Mac.
     var scrollDirectionMultiplier: Int32 = 1
 
@@ -155,6 +160,8 @@ final class IPhoneMirroringController {
     private let config: Config
     private let activationLock = NSLock()
     private var lastActivationUptime: TimeInterval?
+    private let logLock = NSLock()
+    private var lastLoggedApp: pid_t?
 
     init(config: Config) {
         self.config = config
@@ -168,7 +175,11 @@ final class IPhoneMirroringController {
 
         let name = app.localizedName ?? "(unknown name)"
         let bundleID = app.bundleIdentifier ?? "(no bundle identifier)"
-        print("Frontmost app:\n  \(name)\n  \(bundleID)")
+        logLock.lock()
+        let changed = lastLoggedApp != app.processIdentifier
+        lastLoggedApp = app.processIdentifier
+        logLock.unlock()
+        if changed { print("Frontmost app:\n  \(name)\n  \(bundleID)") }
 
         let bundleMatches = app.bundleIdentifier.map {
             config.allowedBundleIdentifiers.contains($0)
@@ -735,7 +746,9 @@ final class PageContextDetector {
         )
         func englishBox(_ text: String, x: ClosedRange<CGFloat>, y: ClosedRange<CGFloat>) -> CGRect? {
             for item in recognizedItems {
-                guard let range = item.candidate.string.range(of: text, options: .caseInsensitive) else { continue }
+                let pattern = text.components(separatedBy: " ")
+                    .map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "\\s*")
+                guard let range = item.candidate.string.range(of: pattern, options: [.caseInsensitive, .regularExpression]) else { continue }
                 // Word boundaries prevent "Send" from matching "Send to" below.
                 let box = ((try? item.candidate.boundingBox(for: range))?.boundingBox) ?? item.box
                 if x.contains(box.midX) && y.contains(box.midY) { return box }
@@ -1086,7 +1099,7 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
                     self.convertQuartzFrameToAppKit(target.frame),
                     display: true
                 )
-                self.panel?.orderFrontRegardless()
+                if let panel = self.panel { self.updateMouseHandling(for: panel) }
             }
             if self.frameTimer == nil {
                 self.startFrameSyncTimer()
@@ -1133,7 +1146,6 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
         view.layer?.addSublayer(layer)
         panel.contentView = view
         updateMouseHandling(for: panel)
-        panel.orderFrontRegardless()
 
         self.panel = panel
         displayLayer = layer
@@ -1170,11 +1182,11 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
             requestCaptureStart()
 
             guard let frame = quartzFrame(for: sourceWindowID) else { return }
-            panel?.setFrame(convertQuartzFrameToAppKit(frame), display: true)
+            let appKitFrame = convertQuartzFrameToAppKit(frame)
+            if panel?.frame != appKitFrame { panel?.setFrame(appKitFrame, display: true) }
             if let panel {
                 updateMouseHandling(for: panel)
             }
-            panel?.orderFrontRegardless()
         }
     }
 
@@ -1199,12 +1211,17 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
     @MainActor
     private func updateMouseHandling(for panel: NSPanel) {
         let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        // When the real iPhone Mirroring app is active, let clicks pass through to
-        // it. While another app is active, the preview accepts one click so it can
-        // bring iPhone Mirroring to the foreground.
-        panel.ignoresMouseEvents = config.allowedBundleIdentifiers.contains(
+        // The real window needs no duplicate window above it. Removing the
+        // overlay also avoids racing WindowServer hit-testing during a gesture.
+        let targetIsFrontmost = config.allowedBundleIdentifiers.contains(
             frontmostBundleID ?? ""
         )
+        panel.ignoresMouseEvents = targetIsFrontmost
+        if targetIsFrontmost {
+            if panel.isVisible { panel.orderOut(nil) }
+        } else if !panel.isVisible {
+            panel.orderFrontRegardless()
+        }
     }
 
     @MainActor
@@ -1216,6 +1233,7 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
         }
         let activated = mirroringController.activateTargetApplication()
         panel?.ignoresMouseEvents = true
+        panel?.orderOut(nil)
         print("Floating preview click: activated iPhone Mirroring = \(activated).")
     }
 
@@ -1259,11 +1277,252 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
 
 // MARK: - Gesture generation
 
+// Captures both scroll-wheel events and their native scroll-gesture companions.
+// No keyboard events, screen images, or other gesture subtypes are retained.
+// Type 29/subtype 6 is an undocumented macOS event representation, isolated
+// here; OS changes require fresh calibration. Do not synthesize its opaque
+// payload or infer an opposite direction by negating its public delta fields.
+final class NativeScrollCalibration {
+    final class RuntimeSample: @unchecked Sendable {
+        let offset: TimeInterval
+        let event: CGEvent
+
+        init(offset: TimeInterval, event: CGEvent) {
+            self.offset = offset
+            self.event = event
+        }
+    }
+    struct Sample: Codable {
+        let offset: TimeInterval
+        let data: Data
+    }
+    struct Archive: Codable {
+        var version = 4
+        let system: String
+        let next: [Sample]
+        let previous: [Sample]
+    }
+    static let shared = NativeScrollCalibration()
+    private let lock = NSLock()
+    private let saveQueue = DispatchQueue(label: "iphone-scroll-control.calibration-save")
+    private var profiles: [String: [RuntimeSample]] = [:]
+    private var serializedProfiles: [String: [Sample]] = [:]
+    // Pending data is accessed only on the event-tap main run loop.
+    private var pending: [Sample] = []
+    private var pendingNative: [RuntimeSample] = []
+    private var started: TimeInterval = 0
+    private var lastEventUptime: TimeInterval = 0
+    private var captureGeneration: UInt64 = 0
+    private var total: Int64 = 0
+    private let fileURL: URL
+    static let companionEventType: UInt32 = 29
+    private static let companionSubtype = CGEventField(rawValue: 110)!
+    private static let companionPhase = CGEventField(rawValue: 132)!
+
+    static func isSupportedEvent(_ event: CGEvent) -> Bool {
+        if event.type == .scrollWheel {
+            return event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
+        }
+        return event.type.rawValue == companionEventType
+            && event.getIntegerValueField(companionSubtype) == 6
+    }
+
+    fileprivate init(fileURL: URL? = nil) {
+        // CGEvent's public serialized representation round-trips all fields we
+        // can inspect, but TikTok in iPhone Mirroring does not commit paging
+        // when those re-created events are posted. The original in-memory
+        // CGEvent copies do work in both directions. Production therefore
+        // records a fresh pair for each process lifetime. Tests inject a URL
+        // and still exercise archive validation without enabling the broken
+        // production restore path.
+        let loadPersistedEvents = fileURL != nil
+        self.fileURL = fileURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("iPhoneScrollControl/TikTokNativeGestures-v4.json")
+        let fileURL = self.fileURL
+        guard loadPersistedEvents else {
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                print("Stored TikTok gesture metadata found; fresh in-memory calibration is required after every tool restart.")
+            }
+            return
+        }
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              let size = attributes[.size] as? NSNumber, size.intValue <= 8_388_608,
+              let bytes = try? Data(contentsOf: fileURL),
+              let archive = try? JSONDecoder().decode(Archive.self, from: bytes),
+              archive.version == 4,
+              archive.system == ProcessInfo.processInfo.operatingSystemVersionString else { return }
+        for (key, samples) in [("up", archive.next), ("down", archive.previous)] {
+            guard Self.valid(samples) else { continue }
+            let native = samples.compactMap { sample -> RuntimeSample? in
+                guard let event = CGEvent(withDataAllocator: nil, data: sample.data as CFData) else { return nil }
+                return RuntimeSample(offset: sample.offset, event: event)
+            }
+            let total = native.filter { $0.event.type == .scrollWheel }
+                .reduce(Int64(0)) { $0 + $1.event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1) }
+            let directionMatches = key == "up" ? total <= -40 : total >= 40
+            guard Self.isComplete(native), directionMatches else { continue }
+            profiles[key] = native
+            serializedProfiles[key] = samples
+            print("Loaded TikTok \(key == "up" ? "NEXT" : "PREVIOUS") native gesture: \(native.count) events (wheel + companions).")
+        }
+    }
+
+    private static func valid(_ samples: [Sample]) -> Bool {
+        guard (5...800).contains(samples.count), let last = samples.last, last.offset <= 3 else { return false }
+        var previous: TimeInterval = 0
+        for sample in samples {
+            guard sample.offset.isFinite, sample.offset >= previous, sample.data.count < 65_536,
+                  let event = CGEvent(withDataAllocator: nil, data: sample.data as CFData),
+                  Self.isSupportedEvent(event) else { return false }
+            let deltaFields: [CGEventField] = event.type == .scrollWheel
+                ? [.scrollWheelEventPointDeltaAxis1, .scrollWheelEventPointDeltaAxis2]
+                : [CGEventField(rawValue: 116)!, CGEventField(rawValue: 119)!]
+            guard deltaFields.allSatisfy({ field in
+                let value = event.getDoubleValueField(field)
+                return value.isFinite && abs(value) <= 1_000_000
+            }) else { return false }
+            previous = sample.offset
+        }
+        return true
+    }
+
+    func profile(_ direction: SwipeDirection) -> [RuntimeSample]? {
+        lock.lock(); defer { lock.unlock() }
+        return profiles[direction.rawValue]
+    }
+
+    private static func isComplete(_ samples: [RuntimeSample]) -> Bool {
+        guard samples.allSatisfy({ isSupportedEvent($0.event) }),
+              samples.filter({ $0.event.type.rawValue == companionEventType }).count >= 2 else { return false }
+        var companionStarted = false, companionEnded = false
+        for sample in samples where sample.event.type.rawValue == companionEventType {
+            switch sample.event.getIntegerValueField(companionPhase) {
+            case 128: guard !companionStarted else { return false }
+            case 1: guard !companionStarted else { return false }; companionStarted = true
+            case 2: guard companionStarted && !companionEnded else { return false }
+            case 4: guard companionStarted && !companionEnded else { return false }; companionEnded = true
+            case 0: break
+            default: return false
+            }
+        }
+        guard companionStarted && companionEnded else { return false }
+        let scrolls = samples.filter { $0.event.type == .scrollWheel }
+        guard scrolls.count >= 3 else { return false }
+        var fingerStarted = false, fingerEnded = false
+        var momentumStarted = false, momentumEnded = false
+        for sample in scrolls {
+            let phase = sample.event.getIntegerValueField(.scrollWheelEventScrollPhase)
+            let momentum = sample.event.getIntegerValueField(.scrollWheelEventMomentumPhase)
+            guard phase != 8, !momentumEnded else { return false }
+            switch phase {
+            case 128: guard !fingerStarted else { return false }
+            case 1: guard !fingerStarted else { return false }; fingerStarted = true
+            case 2: guard fingerStarted && !fingerEnded else { return false }
+            case 4: guard fingerStarted && !fingerEnded else { return false }; fingerEnded = true
+            case 0: break
+            default: return false
+            }
+            switch momentum {
+            case 1: guard fingerEnded && !momentumStarted else { return false }; momentumStarted = true
+            case 2: guard momentumStarted else { return false }
+            case 3: guard momentumStarted else { return false }; momentumEnded = true
+            case 0: break
+            default: return false
+            }
+        }
+        return fingerStarted && fingerEnded && (!momentumStarted || momentumEnded)
+    }
+
+    func cancelCapture() {
+        captureGeneration &+= 1
+        started = 0
+        pending.removeAll()
+        pendingNative.removeAll()
+    }
+
+    func observe(_ event: CGEvent, mayStart: Bool) {
+        guard Self.isSupportedEvent(event) else { return }
+        let phase = event.getIntegerValueField(event.type == .scrollWheel
+            ? .scrollWheelEventScrollPhase : Self.companionPhase)
+        let now = ProcessInfo.processInfo.systemUptime
+
+        // Vision can briefly classify the animated feed as `other` while it
+        // moves. Use page recognition only to admit the first event, then keep
+        // every native event through the end of momentum. Previously the
+        // caller filtered every event through OCR, which silently dropped the
+        // gesture tail and prevented a calibration file from ever being made.
+        let beginsGesture = phase == 128 || phase == 1
+            || (started == 0 && now - lastEventUptime > 0.6)
+        if started == 0, beginsGesture, mayStart {
+            pending.removeAll()
+            pendingNative.removeAll()
+            total = 0
+            started = now
+            print("TikTok native gesture capture started (wheel + companion events).")
+        }
+        lastEventUptime = now
+        guard started > 0 else { return }
+        guard now - started < 3, pending.count < 800 else {
+            print("TikTok calibration discarded: gesture exceeded capture limits.")
+            started = 0
+            pending.removeAll()
+            pendingNative.removeAll()
+            return
+        }
+        guard let nativeCopy = event.copy(), let bytes = event.data else { return }
+        pendingNative.append(RuntimeSample(offset: now - started, event: nativeCopy))
+        pending.append(Sample(offset: now - started, data: bytes as Data))
+        if event.type == .scrollWheel { total += event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1) }
+
+        // Wait for both streams to become quiet: a companion can arrive after
+        // the last wheel event. Stopping at wheel momentum-ended alone can
+        // truncate its native gesture data.
+        captureGeneration &+= 1
+        let generation = captureGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.captureGeneration == generation,
+                  self.started > 0 else { return }
+            self.finishCapture()
+        }
+    }
+
+    private func finishCapture() {
+        defer { started = 0; pending.removeAll(); pendingNative.removeAll() }
+        guard abs(total) >= 40, pendingNative.count == pending.count,
+              Self.valid(pending), Self.isComplete(pendingNative) else {
+            print("TikTok calibration discarded: incomplete gesture (events=\(pending.count), total=\(total)).")
+            return
+        }
+        let key = total < 0 ? "up" : "down"
+        lock.lock()
+        // Do not overwrite a calibration with subsequent incidental scrolling.
+        guard profiles[key] == nil else { lock.unlock(); return }
+        profiles[key] = pendingNative
+        serializedProfiles[key] = pending
+        let archive = Archive(system: ProcessInfo.processInfo.operatingSystemVersionString,
+                              next: serializedProfiles["up"] ?? [],
+                              previous: serializedProfiles["down"] ?? [])
+        lock.unlock()
+        let wheelCount = pendingNative.filter { $0.event.type == .scrollWheel }.count
+        print("Calibrated TikTok \(total < 0 ? "NEXT" : "PREVIOUS"): wheel=\(wheelCount), companions=\(pending.count - wheelCount), total=\(total)")
+        let url = fileURL
+        saveQueue.async {
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(archive).write(to: url, options: .atomic)
+                print("Saved local native scroll calibration: \(url.path)")
+            } catch { print("Could not save calibration: \(error.localizedDescription)") }
+        }
+    }
+}
+
 final class SwipeController {
     private let config: Config
     private let mirroringController: IPhoneMirroringController
     private let pageContextDetector: PageContextDetector
     private let gestureQueue = DispatchQueue(label: "iphone-scroll-control.gestures")
+    private let swipeLock = NSLock()
+    private var swipeInFlight = false
 
     init(config: Config, mirroringController: IPhoneMirroringController, pageContextDetector: PageContextDetector) {
         self.config = config
@@ -1276,11 +1535,24 @@ final class SwipeController {
         app: NSRunningApplication,
         ensureContentFocus: Bool = false
     ) {
+        swipeLock.lock()
+        guard !swipeInFlight else {
+            swipeLock.unlock()
+            print("Swipe ignored: one gesture is already in progress (no queue).")
+            return
+        }
+        swipeInFlight = true
+        swipeLock.unlock()
         gestureQueue.async { [self] in
+            defer {
+                swipeLock.lock(); swipeInFlight = false; swipeLock.unlock()
+            }
             mirroringController.waitForActivationToSettle()
-            guard let frame = mirroringController.focusedWindowFrame(of: app) else { return }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+                  !app.isHidden,
+                  let frame = mirroringController.focusedWindowFrame(of: app) else { return }
 
-            if ensureContentFocus {
+            if ensureContentFocus && !pageContextDetector.tikTokLayout().enabled {
                 let focusPoint = CGPoint(x: frame.midX, y: frame.midY)
                 print("Focusing mirrored content before first swipe at \(pointDescription(focusPoint)).")
                 postMouse(type: .leftMouseDown, point: focusPoint, button: .left)
@@ -1560,6 +1832,10 @@ final class SwipeController {
     }
 
     private func performScroll(_ direction: SwipeDirection, in frame: CGRect) {
+        if pageContextDetector.tikTokLayout().enabled {
+            performTikTokScroll(direction, in: frame)
+            return
+        }
         let point = CGPoint(
             x: frame.minX + frame.width * config.horizontalRatio,
             y: frame.midY
@@ -1599,7 +1875,119 @@ final class SwipeController {
             return
         }
         event.location = point
+        event.setIntegerValueField(.eventSourceUserData, value: syntheticReplayMarker)
         event.post(tap: .cghidEventTap)
+    }
+
+    private func performTikTokScroll(_ direction: SwipeDirection, in frame: CGRect) {
+        guard let samples = NativeScrollCalibration.shared.profile(direction) else {
+            print("TikTok calibration required: use the trackpad once to \(direction == .up ? "go to NEXT" : "go to PREVIOUS") video, then retry the key.")
+            return
+        }
+        guard let target = mirroringController.frontmostTargetApplication(),
+              let pointer = CGEvent(source: nil)?.location else { return }
+        let content = frame.insetBy(dx: frame.width * 0.15, dy: frame.height * 0.18)
+        let point = content.contains(pointer) ? pointer
+            : CGPoint(x: frame.minX + frame.width * config.horizontalRatio, y: frame.midY)
+        // Arrows also work after Command-Tab with the pointer outside the phone.
+        // Move once, never in a loop. Any subsequent real movement cancels this
+        // bounded gesture, so the user can always leave the mirrored window.
+        if point != pointer {
+            CGWarpMouseCursorPosition(point)
+            usleep(20_000)
+        }
+        let start = ProcessInfo.processInfo.systemUptime
+        var sent = 0
+        print("Replaying calibrated TikTok \(direction == .up ? "NEXT" : "PREVIOUS"): \(samples.count) events, duration=\(samples.last?.offset ?? 0)s")
+        for sample in samples {
+            // Absolute deadlines prevent callback/WindowServer overhead from
+            // stretching the gesture on every sample (measured +24% before).
+            let delay = start + sample.offset - ProcessInfo.processInfo.systemUptime
+            if delay > 0 { usleep(useconds_t(delay * 1_000_000)) }
+            let currentPointer = CGEvent(source: nil)?.location ?? point
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier,
+                  !target.isHidden,
+                  hypot(currentPointer.x - point.x, currentPointer.y - point.y) < 24 else {
+                // Terminate only the original target's gesture; do not inject
+                // into a newly focused app or warp the pointer back to the phone.
+                if sent > 0, let cancel = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
+                    wheelCount: 1, wheel1: 0, wheel2: 0, wheel3: 0) {
+                    cancel.location = currentPointer
+                    cancel.setIntegerValueField(.scrollWheelEventScrollPhase, value: 8)
+                    cancel.setIntegerValueField(.scrollWheelEventMomentumPhase, value: 3)
+                    cancel.setIntegerValueField(.eventSourceUserData, value: syntheticReplayMarker)
+                    cancel.postToPid(target.processIdentifier)
+                }
+                print("TikTok replay cancelled after \(sent) events: focus/visibility/pointer changed.")
+                return
+            }
+            guard let event = sample.event.copy(), NativeScrollCalibration.isSupportedEvent(event) else { return }
+            event.location = point
+            event.timestamp = DispatchTime.now().uptimeNanoseconds
+            event.setIntegerValueField(.eventSourceUserData, value: syntheticReplayMarker)
+            event.post(tap: .cgSessionEventTap)
+            sent += 1
+        }
+        print(String(format: "TikTok replay completed: %d events in %.3fs.", sent,
+                     ProcessInfo.processInfo.systemUptime - start))
+    }
+
+    // Retained for diagnostics only; the production TikTok path uses native
+    // calibrated events because constructed events rebounded on this device.
+    private func performUncalibratedTikTokScroll(_ direction: SwipeDirection, in frame: CGRect) {
+        let point = CGPoint(x: frame.minX + frame.width * config.horizontalRatio, y: frame.midY)
+        let sign: CGFloat = direction == .up ? -1 : 1
+        // Runtime calibration avoids replacing the signed app for a distance
+        // adjustment. Missing/invalid values use the tested default.
+        let configuredRatio = UserDefaults.standard.double(forKey: "TikTokScrollHeightRatio")
+        let ratio = configuredRatio.isFinite && configuredRatio >= 0.25 && configuredRatio <= 3
+            ? CGFloat(configuredRatio) : config.tikTokScrollHeightRatio
+        let total = Int32((sign * frame.height * ratio
+            * CGFloat(config.scrollDirectionMultiplier)).rounded())
+        let steps = max(2, config.swipeSteps)
+        let delay = max(0.01, config.tikTokScrollDuration) / Double(steps)
+        print("Performing TikTok continuous scroll: direction = \(direction.rawValue), pixels = \(total), steps = \(steps)")
+        CGWarpMouseCursorPosition(point)
+        usleep(20_000)
+        func post(_ delta: Int32, phase: Int64, momentum: Int64 = 0) {
+            guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
+                                      wheelCount: 1, wheel1: delta, wheel2: 0, wheel3: 0) else { return }
+            event.location = point
+            event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+            event.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
+            event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentum)
+            event.setIntegerValueField(.eventSourceUserData, value: syntheticReplayMarker)
+            event.post(tap: .cghidEventTap)
+        }
+        // Match the observed trackpad lifecycle, including lift-off momentum.
+        // Sending a zero-distance began followed by uniform deltas and no
+        // momentum only made this TikTok version rebound to the same video.
+        post(0, phase: Int64(CGScrollPhase.mayBegin.rawValue))
+        usleep(8_000)
+        let fingerTotal = Int32((Double(total) * 0.30).rounded())
+        var sent: Int32 = 0
+        for step in 1...steps {
+            let progress = Double(step) / Double(steps)
+            let target = Int32((Double(fingerTotal) * progress * progress).rounded())
+            post(target - sent, phase: Int64(step == 1 ? CGScrollPhase.began.rawValue : CGScrollPhase.changed.rawValue))
+            sent = target
+            usleep(useconds_t(delay * 1_000_000))
+        }
+        post(0, phase: Int64(CGScrollPhase.ended.rawValue))
+        // Smooth deceleration with a bounded total distance; never append an
+        // unbounded second scroll burst after the feed has already paged.
+        let momentumTotal = total - fingerTotal
+        let momentumSteps = 32
+        sent = 0
+        for step in 1...momentumSteps {
+            let progress = Double(step) / Double(momentumSteps)
+            let eased = 1 - pow(1 - progress, 3)
+            let target = Int32((Double(momentumTotal) * eased).rounded())
+            post(target - sent, phase: 0, momentum: step == 1 ? 1 : 2)
+            sent = target
+            usleep(8_000)
+        }
+        post(0, phase: 0, momentum: 3)
     }
 
     private func postMouse(
@@ -1657,6 +2045,8 @@ final class MouseEventMonitor {
     private let pageContextDetector: PageContextDetector
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var nativeCaptureTap: CFMachPort?
+    private var nativeCaptureRunLoopSource: CFRunLoopSource?
     private var lastTriggerByButton: [Int64: TimeInterval] = [:]
     private var consumeNextLeftMouseUp = false
     private var consumedKeyboardKeyUps: Set<Int64> = []
@@ -1664,12 +2054,22 @@ final class MouseEventMonitor {
     private var shareSelectionStartedUptime: TimeInterval?
     private var selectedShareRecipients: Set<Int> = []
     private var textInputProtectionUntil: TimeInterval = 0
+    private var lastTikTokWheelUptime: TimeInterval = 0
     // Douyin normally starts a feed video automatically. Keep this state in
     // sync with Space, navigation, and direct taps so hide/minimize is
     // idempotent: it pauses only when playback is currently active.
     private var videoIsPlaying = true
     private var needsContentFocusBeforeSwipe = true
     private var workspaceActivationObserver: NSObjectProtocol?
+    // AX can block long enough to interrupt the cadence of a trackpad gesture.
+    // Refresh this on the main run loop, never once per scroll event in the tap.
+    private struct ScrollTargetSnapshot {
+        let app: NSRunningApplication
+        let frame: CGRect
+        let capturedUptime: TimeInterval
+    }
+    private var scrollTargetSnapshot: ScrollTargetSnapshot?
+    private var scrollTargetRefreshTimer: Timer?
 
     init(
         config: Config,
@@ -1690,6 +2090,7 @@ final class MouseEventMonitor {
             | (CGEventMask(1) << CGEventType.leftMouseUp.rawValue)
             | (CGEventMask(1) << CGEventType.keyDown.rawValue)
             | (CGEventMask(1) << CGEventType.keyUp.rawValue)
+            | (CGEventMask(1) << CGEventType.scrollWheel.rawValue)
 
         let callback: CGEventTapCallBack = { _, type, event, userInfo in
             guard let userInfo else { return Unmanaged.passUnretained(event) }
@@ -1697,8 +2098,11 @@ final class MouseEventMonitor {
             return monitor.handle(type: type, event: event)
         }
 
+        // iPhone Mirroring can consume navigation keys before a session-level
+        // tap observes them. Listen at HID level so arrows are seen before the
+        // mirrored device handles them (Input Monitoring is still required).
         eventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
+            tap: .cghidEventTap,
             place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: mask,
@@ -1715,11 +2119,53 @@ final class MouseEventMonitor {
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
         guard let runLoopSource else {
             print("Failed to create event-tap run-loop source.")
+            stop()
+            return false
+        }
+
+        // A real trackpad gesture includes companion gesture events which are
+        // absent from a scrollWheel-only recording. Capture both at the session
+        // tail without modifying input; HID still owns shortcut interception.
+        let captureMask = (CGEventMask(1) << CGEventType.scrollWheel.rawValue)
+            | (CGEventMask(1) << NSEvent.EventType.gesture.rawValue)
+            | (CGEventMask(1) << CGEventType.leftMouseDown.rawValue)
+        nativeCaptureTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .tailAppendEventTap,
+            options: .listenOnly,
+            eventsOfInterest: captureMask,
+            callback: { _, type, event, userInfo in
+                guard let userInfo else { return Unmanaged.passUnretained(event) }
+                let monitor = Unmanaged<MouseEventMonitor>.fromOpaque(userInfo).takeUnretainedValue()
+                return monitor.observeNativeScroll(type: type, event: event)
+            },
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        )
+        guard let nativeCaptureTap else {
+            print("Failed to create native scroll capture event tap.")
+            print("Please enable Input Monitoring / Accessibility permissions, then restart the program.")
+            stop()
+            return false
+        }
+        nativeCaptureRunLoopSource = CFMachPortCreateRunLoopSource(
+            kCFAllocatorDefault, nativeCaptureTap, 0
+        )
+        guard let nativeCaptureRunLoopSource else {
+            print("Failed to create native scroll capture run-loop source.")
+            stop()
             return false
         }
 
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        CFRunLoopAddSource(CFRunLoopGetMain(), nativeCaptureRunLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
+        CGEvent.tapEnable(tap: nativeCaptureTap, enable: true)
+        refreshScrollTargetSnapshot()
+        let refreshTimer = Timer(timeInterval: 0.10, repeats: true) { [weak self] _ in
+            self?.refreshScrollTargetSnapshot()
+        }
+        scrollTargetRefreshTimer = refreshTimer
+        RunLoop.main.add(refreshTimer, forMode: .common)
         workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
@@ -1736,11 +2182,79 @@ final class MouseEventMonitor {
             } ?? false
             if bundleMatches || nameMatches {
                 self.needsContentFocusBeforeSwipe = true
+                self.refreshScrollTargetSnapshot()
                 print("iPhone Mirroring activated; next swipe will restore content focus.")
+            } else {
+                self.clearScrollTargetSnapshot()
             }
         }
         print("Mouse monitor active. Press side buttons to display their button numbers.")
+        print("Native scroll capture active: session tail, scroll + companion gesture events, listen-only.")
         return true
+    }
+
+    func stop() {
+        scrollTargetRefreshTimer?.invalidate()
+        scrollTargetRefreshTimer = nil
+        if let workspaceActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
+            self.workspaceActivationObserver = nil
+        }
+        for source in [runLoopSource, nativeCaptureRunLoopSource].compactMap({ $0 }) {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            CFRunLoopSourceInvalidate(source)
+        }
+        for tap in [eventTap, nativeCaptureTap].compactMap({ $0 }) {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
+        }
+        runLoopSource = nil
+        nativeCaptureRunLoopSource = nil
+        eventTap = nil
+        nativeCaptureTap = nil
+        clearScrollTargetSnapshot()
+    }
+
+    deinit {
+        stop()
+    }
+
+    private func observeNativeScroll(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            NativeScrollCalibration.shared.cancelCapture()
+            if let nativeCaptureTap { CGEvent.tapEnable(tap: nativeCaptureTap, enable: true) }
+            print("Native scroll capture tap was disabled and has been re-enabled; partial capture discarded.")
+            return Unmanaged.passUnretained(event)
+        }
+        guard event.getIntegerValueField(.eventSourceUserData) != syntheticReplayMarker else {
+            return Unmanaged.passUnretained(event)
+        }
+        if type == .leftMouseDown {
+            NativeScrollCalibration.shared.cancelCapture()
+            return Unmanaged.passUnretained(event)
+        }
+        guard NativeScrollCalibration.isSupportedEvent(event) else {
+            return Unmanaged.passUnretained(event)
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        // Companion gestures can carry a zero/non-screen event location.
+        // Hit-test their current cursor location instead of dropping them.
+        let capturePoint: CGPoint? = type == .scrollWheel
+            ? event.location : CGEvent(source: nil)?.location
+        guard let snapshot = scrollTargetSnapshot,
+              let capturePoint,
+              now - snapshot.capturedUptime <= 0.25,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.app.processIdentifier,
+              !snapshot.app.isHidden,
+              snapshot.frame.contains(capturePoint) else {
+            NativeScrollCalibration.shared.cancelCapture()
+            return Unmanaged.passUnretained(event)
+        }
+        NativeScrollCalibration.shared.observe(event,
+            mayStart: pageContextDetector.tikTokLayout().enabled
+                && pageContextDetector.isVideoPageOrRecentlyConfirmed()
+                && now >= textInputProtectionUntil)
+        return Unmanaged.passUnretained(event)
     }
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -1752,6 +2266,52 @@ final class MouseEventMonitor {
 
         if event.getIntegerValueField(.eventSourceUserData) == syntheticReplayMarker {
             return Unmanaged.passUnretained(event)
+        }
+
+        if type == .leftMouseDown {
+            // A consumed HID click might never reach the listen-only session
+            // tap, so discard a partial capture before any click routing.
+            NativeScrollCalibration.shared.cancelCapture()
+        }
+
+        if type == .scrollWheel {
+            if event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0 {
+                return Unmanaged.passUnretained(event)
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard let snapshot = scrollTargetSnapshot,
+                  now - snapshot.capturedUptime <= 0.25,
+                  snapshot.frame.contains(event.location) else {
+                NativeScrollCalibration.shared.cancelCapture()
+                return Unmanaged.passUnretained(event)
+            }
+
+            // Only discrete mouse wheels on a confirmed TikTok feed are
+            // converted. Every other scroll must pass through here, not enter
+            // the side-button branch: mouseEventButtonNumber is not a scroll
+            // event field and cannot be used to decide whether to consume it.
+            guard config.tikTokWheelPaging,
+                  event.flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty,
+                  pageContextDetector.tikTokLayout().enabled,
+                  pageContextDetector.currentPageKind() == .video,
+                  now >= textInputProtectionUntil else {
+                return Unmanaged.passUnretained(event)
+            }
+            let delta = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+            guard delta != 0,
+                  event.getIntegerValueField(.scrollWheelEventDeltaAxis2) == 0 else {
+                return Unmanaged.passUnretained(event)
+            }
+            guard NativeScrollCalibration.shared.profile(delta < 0 ? .up : .down) != nil else {
+                return Unmanaged.passUnretained(event)
+            }
+            let quiet = now - lastTikTokWheelUptime >= config.tikTokWheelQuietInterval
+            lastTikTokWheelUptime = now
+            if quiet {
+                videoIsPlaying = true
+                swipeController.performSwipe(delta < 0 ? .up : .down, app: snapshot.app)
+            }
+            return nil
         }
 
         if type == .leftMouseUp, consumeNextLeftMouseUp {
@@ -1826,6 +2386,11 @@ final class MouseEventMonitor {
 
         if type == .keyDown || type == .keyUp {
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            if type == .keyDown,
+               [config.nextVideoKeyCode, config.previousVideoKeyCode, 123, 124, 125, 126]
+                    .contains(keyCode) {
+                print("Raw navigation key received at HID tap: code = \(keyCode)")
+            }
 
             let isWindowShortcut = config.pauseBeforeMinimizeOrHide
                 && event.flags.contains(.maskCommand)
@@ -1889,6 +2454,7 @@ final class MouseEventMonitor {
             if type == .keyDown,
                !isPotentialControlKey,
                mirroringController.frontmostTargetApplication() != nil {
+                NativeScrollCalibration.shared.cancelCapture()
                 textInputProtectionUntil = ProcessInfo.processInfo.systemUptime
                     + config.textInputProtectionInterval
                 pageContextDetector.invalidate(reason: "ordinary keyboard input")
@@ -2069,6 +2635,9 @@ final class MouseEventMonitor {
             return nil
         }
 
+        guard type == .otherMouseDown || type == .otherMouseUp else {
+            return Unmanaged.passUnretained(event)
+        }
         let button = event.getIntegerValueField(.mouseEventButtonNumber)
 
         if type == .otherMouseDown {
@@ -2156,6 +2725,41 @@ final class MouseEventMonitor {
         }
         return false
     }
+
+    private func refreshScrollTargetSnapshot() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              !app.isHidden,
+              !app.isTerminated else {
+            clearScrollTargetSnapshot()
+            return
+        }
+        let bundleMatches = app.bundleIdentifier.map {
+            config.allowedBundleIdentifiers.contains($0)
+        } ?? false
+        let nameMatches = app.localizedName.map {
+            config.allowedApplicationNames.contains($0)
+        } ?? false
+        guard bundleMatches || nameMatches,
+              mirroringController.isTargetWindowInteractive(app),
+              let frame = mirroringController.focusedWindowFrame(of: app),
+              frame.width > 0, frame.height > 0 else {
+            clearScrollTargetSnapshot()
+            return
+        }
+        if let previous = scrollTargetSnapshot,
+           previous.app.processIdentifier != app.processIdentifier {
+            NativeScrollCalibration.shared.cancelCapture()
+        }
+        scrollTargetSnapshot = ScrollTargetSnapshot(
+            app: app, frame: frame, capturedUptime: now
+        )
+    }
+
+    private func clearScrollTargetSnapshot() {
+        scrollTargetSnapshot = nil
+        NativeScrollCalibration.shared.cancelCapture()
+    }
 }
 
 // MARK: - Startup
@@ -2171,6 +2775,7 @@ if !AXIsProcessTrustedWithOptions(promptOptions) {
     print("Accessibility permission required.")
     print("Grant access in System Settings > Privacy & Security > Accessibility, then restart this program.")
 }
+print("Permission preflight: accessibility=\(AXIsProcessTrusted()), inputMonitoring=\(CGPreflightListenEventAccess()), screenRecording=\(CGPreflightScreenCaptureAccess())")
 
 if let app = NSWorkspace.shared.frontmostApplication {
     print("Frontmost app at launch:\n  \(app.localizedName ?? "(unknown name)")\n  \(app.bundleIdentifier ?? "(no bundle identifier)")")
