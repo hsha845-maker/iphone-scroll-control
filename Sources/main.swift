@@ -92,6 +92,9 @@ struct Config {
     var shareCloseXRatio: CGFloat = 0.91
     var shareCloseYRatio: CGFloat = 0.67
     var shareSendKeyCodes: Set<Int64> = [36, 76] // Return, keypad Enter
+    // Calibrated against the English TikTok iPhone share sheet (six columns).
+    var tikTokShareButtonYRatio: CGFloat = 0.78
+    var tikTokRecipientXRatios: [CGFloat] = [0.115, 0.28, 0.445, 0.605, 0.77]
     // Give iPhone Mirroring time to finish becoming key/frontmost before the
     // first synthetic scroll after clicking the floating preview.
     var activationSettleInterval: TimeInterval = 0.70
@@ -595,6 +598,17 @@ final class PageContextDetector {
     private var contextRevision: UInt64 = 0
     private var lastConfirmedVideoUptime: TimeInterval = 0
     private var lastConfirmedShareUptime: TimeInterval = 0
+    private var englishTikTok = false
+    private var englishShareHeader: CGPoint?
+    private var englishSendPoint: CGPoint?
+
+    func tikTokLayout() -> (enabled: Bool, header: CGPoint?, send: CGPoint?) {
+        lock.lock()
+        defer { lock.unlock() }
+        let fresh = ProcessInfo.processInfo.systemUptime - lastAnalysisUptime < 1.5
+        return (englishTikTok, fresh && pageKind == .share ? englishShareHeader : nil,
+                fresh && pageKind == .share ? englishSendPoint : nil)
+    }
 
     init(config: Config) {
         self.config = config
@@ -625,6 +639,7 @@ final class PageContextDetector {
         lock.lock()
         defer { lock.unlock() }
         if pageKind == .share { return true }
+        if englishTikTok { return false }
         guard lastConfirmedShareUptime > 0 else { return false }
         return ProcessInfo.processInfo.systemUptime - lastConfirmedShareUptime
             <= config.shareRecognitionGraceInterval
@@ -637,6 +652,8 @@ final class PageContextDetector {
         multipleShareSendButtonVisible = false
         lastConfirmedVideoUptime = 0
         lastConfirmedShareUptime = 0
+        englishShareHeader = nil
+        englishSendPoint = nil
         contextRevision &+= 1
         lock.unlock()
         if changed {
@@ -716,7 +733,28 @@ final class PageContextDetector {
         let hasTopRecommendedTab = containsToken(
             "推荐", xRange: 0.52...1.00, yRange: 0.78...1.00
         )
-        let isHomeRecommendedFeed = hasBottomHomeTab && hasTopRecommendedTab
+        func englishBox(_ text: String, x: ClosedRange<CGFloat>, y: ClosedRange<CGFloat>) -> CGRect? {
+            for item in recognizedItems {
+                guard let range = item.candidate.string.range(of: text, options: .caseInsensitive) else { continue }
+                // Word boundaries prevent "Send" from matching "Send to" below.
+                let box = ((try? item.candidate.boundingBox(for: range))?.boundingBox) ?? item.box
+                if x.contains(box.midX) && y.contains(box.midY) { return box }
+            }
+            return nil
+        }
+        let englishHome = englishBox("Home", x: 0...0.25, y: 0...0.15) != nil
+        let englishForYou = englishBox("For You", x: 0.4...0.9, y: 0.78...0.97) != nil
+        let isEnglishFeed = englishHome && englishForYou
+        let isHomeRecommendedFeed = (hasBottomHomeTab && hasTopRecommendedTab) || isEnglishFeed
+        let sendToBox = englishBox("Send to", x: 0.05...0.8, y: 0.2...0.65)
+            ?? englishBox("Share to", x: 0.05...0.8, y: 0.2...0.65)
+        let lowerEnglishActions = ["Copy link", "WhatsApp", "Repost", "Send", "Add message", "Write a message"]
+            .filter { englishBox($0, x: 0...1, y: 0...0.5) != nil }.count
+        let isEnglishShare = sendToBox != nil && lowerEnglishActions >= 1
+        let sendBox = recognizedItems.first { item in
+            let label = item.text.lowercased()
+            return (label == "send" || label == "sendseparately") && item.box.midY < 0.35
+        }?.box
 
         // Detect the share sheet independently so it also works when the user
         // opens it by clicking the UI rather than with Right Arrow. Evaluate it
@@ -729,8 +767,8 @@ final class PageContextDetector {
         // After a recipient is selected, Douyin sometimes removes the lower
         // action row. In that state the stable markers are only 分享给 and the
         // red 发送 button, so recognize that compact layout too.
-        let isShareSheet = compact.contains("分享给")
-            && (shareMarkerHits >= 1 || compact.contains("发送"))
+        let isShareSheet = isEnglishShare || (compact.contains("分享给")
+            && (shareMarkerHits >= 1 || compact.contains("发送")))
 
         let detected: MirroredPageKind
         if isShareSheet {
@@ -749,6 +787,12 @@ final class PageContextDetector {
         }
         let changed = detected != pageKind
         pageKind = detected
+        if detected == .video || detected == .share {
+            englishTikTok = isEnglishFeed || isEnglishShare
+        }
+        // Convert Vision bottom-left coordinates to normalized Quartz top-left.
+        englishShareHeader = isEnglishShare ? sendToBox.map { CGPoint(x: $0.midX, y: 1 - $0.midY) } : nil
+        englishSendPoint = isEnglishShare ? sendBox.map { CGPoint(x: $0.midX, y: 1 - $0.midY) } : nil
         multipleShareSendButtonVisible = isShareSheet && compact.contains("分别发送")
         if detected == .video {
             lastConfirmedVideoUptime = ProcessInfo.processInfo.systemUptime
@@ -1218,11 +1262,13 @@ final class FloatingPreviewController: NSObject, SCStreamOutput, SCStreamDelegat
 final class SwipeController {
     private let config: Config
     private let mirroringController: IPhoneMirroringController
+    private let pageContextDetector: PageContextDetector
     private let gestureQueue = DispatchQueue(label: "iphone-scroll-control.gestures")
 
-    init(config: Config, mirroringController: IPhoneMirroringController) {
+    init(config: Config, mirroringController: IPhoneMirroringController, pageContextDetector: PageContextDetector) {
         self.config = config
         self.mirroringController = mirroringController
+        self.pageContextDetector = pageContextDetector
     }
 
     func performSwipe(
@@ -1401,7 +1447,8 @@ final class SwipeController {
             guard let frame = mirroringController.focusedWindowFrame(of: app) else { return }
             let point = CGPoint(
                 x: frame.minX + frame.width * config.shareButtonXRatio,
-                y: frame.minY + frame.height * config.shareButtonYRatio
+                y: frame.minY + frame.height * (pageContextDetector.tikTokLayout().enabled
+                    ? config.tikTokShareButtonYRatio : config.shareButtonYRatio)
             )
             print("Opening share sheet at \(pointDescription(point)).")
             postMouse(type: .leftMouseDown, point: point, button: .left,
@@ -1415,9 +1462,11 @@ final class SwipeController {
     func closeShareSheet(app: NSRunningApplication) {
         gestureQueue.async { [self] in
             guard let frame = mirroringController.focusedWindowFrame(of: app) else { return }
+            let layout = pageContextDetector.tikTokLayout()
+            if layout.enabled && layout.header == nil { return }
             let point = CGPoint(
                 x: frame.minX + frame.width * config.shareCloseXRatio,
-                y: frame.minY + frame.height * config.shareCloseYRatio
+                y: frame.minY + frame.height * (layout.enabled ? layout.header!.y : config.shareCloseYRatio)
             )
             print("Closing share sheet at \(pointDescription(point)).")
             postMouse(type: .leftMouseDown, point: point, button: .left,
@@ -1430,11 +1479,13 @@ final class SwipeController {
 
     func selectShareRecipient(_ index: Int, app: NSRunningApplication) {
         gestureQueue.async { [self] in
+            let layout = pageContextDetector.tikTokLayout()
+            if layout.enabled && layout.header == nil { return }
             guard config.shareRecipientXRatios.indices.contains(index),
                   let frame = mirroringController.focusedWindowFrame(of: app) else { return }
             let point = CGPoint(
-                x: frame.minX + frame.width * config.shareRecipientXRatios[index],
-                y: frame.minY + frame.height * config.shareRecipientYRatio
+                x: frame.minX + frame.width * (layout.enabled ? config.tikTokRecipientXRatios[index] : config.shareRecipientXRatios[index]),
+                y: frame.minY + frame.height * (layout.enabled ? layout.header!.y + 0.055 : config.shareRecipientYRatio)
             )
             print("Selecting share recipient \(index + 1) at \(pointDescription(point)).")
             postMouse(type: .leftMouseDown, point: point, button: .left,
@@ -1447,14 +1498,19 @@ final class SwipeController {
 
     func sendSharedVideo(selectionCount: Int, app: NSRunningApplication) {
         gestureQueue.async { [self] in
+            let layout = pageContextDetector.tikTokLayout()
+            if layout.enabled && layout.send == nil {
+                print("TikTok Send button not recognized; skipping click.")
+                return
+            }
             guard selectionCount > 0,
                   let frame = mirroringController.focusedWindowFrame(of: app) else { return }
             let xRatio = selectionCount == 1
                 ? config.shareSendSingleXRatio
                 : config.shareSendMultipleXRatio
             let point = CGPoint(
-                x: frame.minX + frame.width * xRatio,
-                y: frame.minY + frame.height * config.shareSendYRatio
+                x: frame.minX + frame.width * (layout.enabled ? layout.send!.x : xRatio),
+                y: frame.minY + frame.height * (layout.enabled ? layout.send!.y : config.shareSendYRatio)
             )
             print("Sending shared video to \(selectionCount) recipient(s) at \(pointDescription(point)).")
             postMouse(type: .leftMouseDown, point: point, button: .left,
@@ -1866,7 +1922,7 @@ final class MouseEventMonitor {
             // typing is observed, pass all of those keys through for a short
             // quiet period. The share sheet is exempt because its 1-5/Enter
             // controls are deliberately enabled there.
-            if now < textInputProtectionUntil, pageKind != .share {
+            if now < textInputProtectionUntil {
                 let remaining = textInputProtectionUntil - now
                 print(
                     String(
@@ -2133,7 +2189,8 @@ let floatingPreviewController = FloatingPreviewController(
 )
 let swipeController = SwipeController(
     config: config,
-    mirroringController: mirroringController
+    mirroringController: mirroringController,
+    pageContextDetector: pageContextDetector
 )
 let mouseMonitor = MouseEventMonitor(
     config: config,

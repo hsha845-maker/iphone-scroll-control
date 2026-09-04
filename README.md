@@ -2,7 +2,9 @@
 
 一个轻量级原生 macOS 工具，用 Logitech 鼠标侧键和键盘快捷键控制「iPhone Mirroring / iPhone 镜像」中的抖音视频。
 
-当前版本：**1.1.9**
+当前版本：**1.2.0**
+
+支持抖音中文「首页 / 推荐」和 TikTok 英文「Home / For You」。TikTok 分享面板采用独立布局，1–5 点击当前可见联系人行的前五项，Enter 仅在识别到 Send 按钮时点击。英文初始分享面板已校准，选择联系人后的实际发送需用户验证。
 系统要求：macOS 15 或更高版本
 架构：Apple Silicon（arm64）与 Intel（x86_64）
 
@@ -44,7 +46,7 @@
 
 ## 安装发布版
 
-从 GitHub Releases 下载 `iPhone-Scroll-Control-1.1.9-macOS.dmg`：
+从 GitHub Releases 下载 `iPhone-Scroll-Control-1.2.0-macOS.dmg`：
 
 1. 打开 DMG。
 2. 按住 Control 点击“安装.command”，选择“打开”。
@@ -83,7 +85,7 @@ build/iPhone Scroll Control.app
 输出位置：
 
 ```text
-dist/iPhone-Scroll-Control-1.1.9-macOS.dmg
+dist/iPhone-Scroll-Control-1.2.0-macOS.dmg
 ```
 
 运行静态检查：
