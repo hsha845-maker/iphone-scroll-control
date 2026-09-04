@@ -99,6 +99,10 @@ struct Config {
     // OCR can miss one frame while captions animate. Window actions may still
     // use a recent positive feed result unless direct input invalidated it.
     var videoRecognitionGraceInterval: TimeInterval = 3.0
+    // Selecting a recipient can collapse the share sheet into a simpler
+    // “分享给 + 发送” layout. Keep a short confirmed-share grace period so
+    // Enter remains reliable through that transition.
+    var shareRecognitionGraceInterval: TimeInterval = 5.0
     // While the user is composing text (especially with a Chinese input
     // method), Space/arrows/numbers must reach the input method unchanged.
     var textInputProtectionInterval: TimeInterval = 2.0
@@ -590,6 +594,7 @@ final class PageContextDetector {
     // from restoring a stale page classification after it finishes.
     private var contextRevision: UInt64 = 0
     private var lastConfirmedVideoUptime: TimeInterval = 0
+    private var lastConfirmedShareUptime: TimeInterval = 0
 
     init(config: Config) {
         self.config = config
@@ -616,12 +621,22 @@ final class PageContextDetector {
             <= config.videoRecognitionGraceInterval
     }
 
+    func isSharePageOrRecentlyConfirmed() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if pageKind == .share { return true }
+        guard lastConfirmedShareUptime > 0 else { return false }
+        return ProcessInfo.processInfo.systemUptime - lastConfirmedShareUptime
+            <= config.shareRecognitionGraceInterval
+    }
+
     func invalidate(reason: String) {
         lock.lock()
         let changed = pageKind != .other
         pageKind = .other
         multipleShareSendButtonVisible = false
         lastConfirmedVideoUptime = 0
+        lastConfirmedShareUptime = 0
         contextRevision &+= 1
         lock.unlock()
         if changed {
@@ -706,9 +721,16 @@ final class PageContextDetector {
         // Detect the share sheet independently so it also works when the user
         // opens it by clicking the UI rather than with Right Arrow. Evaluate it
         // before the feed because 推荐 can remain visible behind the sheet.
-        let shareMarkers = ["最近分享", "转发到日常", "私信", "分享至群", "分别发送"]
+        let shareMarkers = [
+            "最近分享", "转发到日常", "私信", "分享至群",
+            "分别发送", "分享此刻的想法"
+        ]
         let shareMarkerHits = shareMarkers.filter { compact.contains($0) }.count
-        let isShareSheet = compact.contains("分享给") && shareMarkerHits >= 1
+        // After a recipient is selected, Douyin sometimes removes the lower
+        // action row. In that state the stable markers are only 分享给 and the
+        // red 发送 button, so recognize that compact layout too.
+        let isShareSheet = compact.contains("分享给")
+            && (shareMarkerHits >= 1 || compact.contains("发送"))
 
         let detected: MirroredPageKind
         if isShareSheet {
@@ -730,8 +752,10 @@ final class PageContextDetector {
         multipleShareSendButtonVisible = isShareSheet && compact.contains("分别发送")
         if detected == .video {
             lastConfirmedVideoUptime = ProcessInfo.processInfo.systemUptime
+            lastConfirmedShareUptime = 0
         } else if detected == .share {
             lastConfirmedVideoUptime = 0
+            lastConfirmedShareUptime = ProcessInfo.processInfo.systemUptime
         }
         lock.unlock()
         if changed {
@@ -1732,9 +1756,16 @@ final class MouseEventMonitor {
            let frame = mirroringController.focusedWindowFrame(of: targetApp),
            frame.contains(event.location) {
             updatePlaybackStateForUserClick(at: event.location, in: frame)
-            pageContextDetector.invalidate(reason: "direct interaction with iPhone Mirroring")
-            shareSelectionStartedUptime = nil
-            selectedShareRecipients.removeAll()
+            if pageContextDetector.isSharePageOrRecentlyConfirmed() {
+                // Keep Enter enabled when the user selects a recipient with
+                // the mouse. OCR will clear this as soon as the feed returns.
+                shareSelectionStartedUptime = ProcessInfo.processInfo.systemUptime
+                print("Direct interaction retained confirmed share-sheet context.")
+            } else {
+                pageContextDetector.invalidate(reason: "direct interaction with iPhone Mirroring")
+                shareSelectionStartedUptime = nil
+                selectedShareRecipients.removeAll()
+            }
         }
 
         if type == .keyDown || type == .keyUp {
@@ -1855,9 +1886,10 @@ final class MouseEventMonitor {
             // Playback controls require the exact 首页 + 推荐 feed. Recipient
             // numbers and Enter require the share sheet to be visible; a stale
             // timeout alone must never consume input on search or chat pages.
-            let validShareAction = pageKind == .share
+            let sharePageConfirmed = pageContextDetector.isSharePageOrRecentlyConfirmed()
+            let validShareAction = sharePageConfirmed
                 && (recipientIndex != nil || isShareSendKey)
-            let validShareClose = pageKind == .share && isShareKey
+            let validShareClose = sharePageConfirmed && isShareKey
             // Animated captions and bullet comments can make Vision miss 首页
             // or 推荐 for a single frame. Accept the short, confirmed-video
             // grace period here as well as for hide/minimize. Direct clicks and
