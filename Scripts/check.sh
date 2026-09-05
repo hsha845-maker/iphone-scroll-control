@@ -8,6 +8,7 @@ mkdir -p "$MODULE_CACHE"
 
 xcrun swiftc -module-cache-path "$MODULE_CACHE" -typecheck "$REPO_ROOT/Sources/main.swift"
 xcrun swift -module-cache-path "$MODULE_CACHE" "$REPO_ROOT/Scripts/test-playback-state.swift"
+xcrun swift -module-cache-path "$MODULE_CACHE" "$REPO_ROOT/Scripts/test-page-recognition.swift"
 plutil -lint "$REPO_ROOT/App/Info.plist"
 plutil -lint "$REPO_ROOT/Installer/local.hongxin.iPhoneScrollControl.plist"
 zsh -n "$REPO_ROOT/Installer/安装.command"

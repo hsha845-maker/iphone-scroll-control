@@ -775,7 +775,6 @@ final class PageContextDetector {
         let englishHome = englishBox("Home", x: 0...0.25, y: 0...0.15) != nil
         let englishForYou = englishBox("For You", x: 0.4...0.9, y: 0.78...0.97) != nil
         let isEnglishFeed = englishHome && englishForYou
-        let isHomeRecommendedFeed = (hasBottomHomeTab && hasTopRecommendedTab) || isEnglishFeed
 
         // The action rail moves vertically on videos that show extra cards or
         // recommendation rows. Its numeric counters are more stable OCR
@@ -792,6 +791,20 @@ final class PageContextDetector {
                   (0.08...0.55).contains(item.box.midY) else { return nil }
             return item.box
         }
+        let rightRailYPositions = rightRailCountBoxes.map(\.midY)
+        let rightRailVerticalSpread = (rightRailYPositions.max() ?? 0)
+            - (rightRailYPositions.min() ?? 0)
+        // Bright captions or a busy video background can hide the selected
+        // 推荐 / For You label from OCR. The bottom Home tab plus at least
+        // three vertically separated numeric counters in the right action rail
+        // is an equally strong feed signature. Search and chat may still show
+        // a bottom tab bar, but they do not have this action rail.
+        let hasVideoActionRail = rightRailCountBoxes.count >= 3
+            && rightRailVerticalSpread >= 0.10
+        let hasHomeTab = hasBottomHomeTab || englishHome
+        let isHomeRecommendedFeed = (hasBottomHomeTab && hasTopRecommendedTab)
+            || isEnglishFeed
+            || (hasHomeTab && hasVideoActionRail)
         let inferredVideoSharePoint = rightRailCountBoxes.min {
             $0.midY < $1.midY
         }.map { box in
