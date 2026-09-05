@@ -8,12 +8,13 @@ INFO_PLIST="$REPO_ROOT/App/Info.plist"
 BUILD_DIR="$REPO_ROOT/build"
 APP_PATH="$BUILD_DIR/iPhone Scroll Control.app"
 MACOS_DIR="$APP_PATH/Contents/MacOS"
+MODULE_CACHE="${TMPDIR:-/tmp}/iphone-scroll-control-swift-module-cache"
 
-mkdir -p "$BUILD_DIR" "$MACOS_DIR"
+mkdir -p "$BUILD_DIR" "$MACOS_DIR" "$MODULE_CACHE"
 
-xcrun swiftc -O -target arm64-apple-macosx15.0 \
+xcrun swiftc -module-cache-path "$MODULE_CACHE" -O -target arm64-apple-macosx15.0 \
     "$SOURCE_FILE" -o "$BUILD_DIR/iphone-scroll-control-arm64"
-xcrun swiftc -O -target x86_64-apple-macosx15.0 \
+xcrun swiftc -module-cache-path "$MODULE_CACHE" -O -target x86_64-apple-macosx15.0 \
     "$SOURCE_FILE" -o "$BUILD_DIR/iphone-scroll-control-x86_64"
 
 lipo -create \

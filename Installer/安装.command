@@ -28,7 +28,7 @@ fi
 /usr/bin/ditto "$SOURCE_APP" "$TARGET_APP"
 /bin/cp "$SCRIPT_DIR/local.hongxin.iPhoneScrollControl.plist" "$AGENT_FILE"
 
-/usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $TARGET_APP/Contents/MacOS/iphone-scroll-control" "$AGENT_FILE"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:2 $TARGET_APP" "$AGENT_FILE"
 /usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/iPhoneScrollControl.log" "$AGENT_FILE"
 /usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/iPhoneScrollControl.error.log" "$AGENT_FILE"
 

@@ -7,3 +7,4 @@ dist/
 DerivedData/
 xcuserdata/
 *.previous-*.app/
+tmp/

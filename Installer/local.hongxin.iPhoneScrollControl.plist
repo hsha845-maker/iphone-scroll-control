@@ -6,6 +6,8 @@
     <string>local.hongxin.iPhoneScrollControl</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/usr/bin/open</string>
+        <string>-gj</string>
         <string>APP_PATH_PLACEHOLDER</string>
     </array>
     <key>RunAtLoad</key>
